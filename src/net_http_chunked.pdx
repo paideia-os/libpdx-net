@@ -1,0 +1,243 @@
+// src/net_http_chunked.pdx -- libpdx-net.M4-003 (libpdx-net#19)
+//
+// HTTP/1.1 chunked transfer-encoding decode (response side).
+//
+// =============================================================================
+// SCOPE (design/networking/r100-user-tools-plan.md §2.5)
+// =============================================================================
+//
+// Common enough on real servers (per issue #19: "skipping it
+// makes the tool unable to talk to a meaningful fraction of
+// HTTP/1.1 servers"). Chunked framing is REQUIRED to be
+// supported by every HTTP/1.1 conforming client per RFC 9112
+// §7.1.
+//
+// The wire shape (RFC 9112 §7.1.1):
+//
+//   chunked-body   = *chunk
+//                    last-chunk
+//                    trailer-section
+//                    CRLF
+//   chunk          = chunk-size [ chunk-ext ] CRLF
+//                    chunk-data CRLF
+//   chunk-size     = 1*HEXDIG
+//   last-chunk     = 1*("0") [ chunk-ext ] CRLF
+//   trailer-section = *( field-line CRLF )
+//
+// This decoder handles the ordinary chunk shape:
+//
+//     <hex>\r\n
+//     <data bytes, exactly hex bytes>\r\n
+//     ...
+//     0\r\n\r\n
+//
+// SCOPE CUTS at v0.1.0:
+//
+//   * NO chunk-ext parsing. Any character between the last
+//     hex digit and the CRLF is skipped verbatim UNLESS it
+//     is a ";" (chunk-ext separator per RFC 9112), which
+//     for v0.1.0 is refused with HTTP_ERR_CHUNK_MALFORMED --
+//     no real server the R100 wave targets uses them, and
+//     accepting them silently would hide a server that is
+//     doing something unexpected. Filed as a future add.
+//
+//   * NO trailer-section parsing. The final `0\r\n\r\n`
+//     terminator ends decoding; a server that emits a real
+//     trailer between the last-chunk and the final CRLF is
+//     refused with HTTP_ERR_CHUNK_MALFORMED. Trailers are
+//     extremely rare in practice and R100 does not target
+//     any server known to use them.
+//
+//   * Hex is case-insensitive per the spec ('a'..'f' == 'A'..'F');
+//     both ranges accepted.
+//
+// =============================================================================
+// DECODER SHAPE
+// =============================================================================
+//
+// Streaming decode over a single input buffer into a single
+// output buffer. Caller passes:
+//
+//   in_va, in_len   -- chunked payload bytes as they arrived
+//                      from the socket (already framed by the
+//                      response's Transfer-Encoding: chunked
+//                      indicator; see net_http_response.pdx)
+//   out_va, out_cap -- caller-owned decoded-body scratch
+//
+// Returns:
+//   >= 0     -> decoded byte count written to out (the actual
+//               body length, sum of every chunk-data run)
+//   err-mask -> (HTTP_ERR_CHUNK_MALFORMED | HTTPCH_ERR_MASK) or
+//               (HTTP_ERR_CHUNK_OVERSIZE  | HTTPCH_ERR_MASK)
+//
+// PARTIAL INPUT: at v0.1.0 the decoder assumes the entire
+// chunked body is present in `in`. Streaming decode (feed a
+// partial buffer, resume later) is a future add -- pdxcurl at
+// v0.1.0 reads the whole response into scratch before invoking
+// this decoder (the max-response-bytes cap upstream keeps this
+// bounded). Filed as a future add on libpdx-net#19 follow-up.
+//
+// SIZE CAPS
+// ---------
+// HTTPCH_CHUNK_MAX_BYTES (16 MiB) is the largest single chunk
+// this decoder accepts. HTTPCH_TOTAL_MAX_BYTES (32 MiB) is the
+// largest decoded-body total. Both refuse with
+// HTTP_ERR_CHUNK_OVERSIZE. These caps exist so a hostile server
+// cannot force an unbounded allocation via a huge chunk-size
+// header; the value pair matches the size hints pdxcurl's own
+// response-buffer cap uses.
+//
+// =============================================================================
+// paideia-as compliance
+// =============================================================================
+//
+//   - Module name PascalCase basename (`NetHttpChunked`) matches file.
+//   - Labels prefixed `libpdxnet_httpch_` -- disjoint from every other
+//     label prefix in this repo, avoids reserved keywords.
+//   - No `test rN, rN` -- cmp/je only (encoder pitfall).
+//   - Only 3-operand `imul r,r,imm` if used (none in this file).
+//   - String literals on single lines.
+
+module NetHttpChunked = structure {
+
+  // === ASCII single-byte constants =========================================
+  pub let HTTPCH_ASCII_CR      : u64 = 0x0D
+  pub let HTTPCH_ASCII_LF      : u64 = 0x0A
+  pub let HTTPCH_ASCII_ZERO    : u64 = 0x30
+  pub let HTTPCH_ASCII_NINE    : u64 = 0x39
+  pub let HTTPCH_ASCII_A_UPPER : u64 = 0x41
+  pub let HTTPCH_ASCII_F_UPPER : u64 = 0x46
+  pub let HTTPCH_ASCII_A_LOWER : u64 = 0x61
+  pub let HTTPCH_ASCII_F_LOWER : u64 = 0x66
+  pub let HTTPCH_ASCII_SEMI    : u64 = 0x3B    // chunk-ext -- refused at v0.1.0
+
+  // === Size caps ===========================================================
+  //
+  // 16 MiB and 32 MiB. Both fit imm32 (0x01000000 and 0x02000000)
+  // so no MOVABS staging needed.
+  pub let HTTPCH_CHUNK_MAX_BYTES : u64 = 16777216   // 16 MiB per single chunk
+  pub let HTTPCH_TOTAL_MAX_BYTES : u64 = 33554432   // 32 MiB decoded total
+
+  // === Terminator sentinel =================================================
+  //
+  // A last-chunk is the ASCII sequence "0\r\n\r\n" (five bytes).
+  // The decoder recognises it as a chunk-size of 0 followed by
+  // an immediate blank CRLF (no chunk-data, no trailer-section).
+  pub let HTTPCH_LAST_CHUNK_SIZE : u64 = 0
+
+  // === Error / status aliases (from NetTypes.HttpErr band) =================
+  pub let HTTPCH_OK              : u64 = 0x30
+  pub let HTTPCH_ERR_MALFORMED   : u64 = 0x36
+  pub let HTTPCH_ERR_OVERSIZE    : u64 = 0x37
+  pub let HTTPCH_ERR_NOT_IMPL    : u64 = 0x3F
+  pub let HTTPCH_ERR_MASK        : u64 = 0x8000000000000000
+
+  // ==========================================================================
+  // net_http_chunked_decode_stub(in_va, in_len, out_va, out_cap) -> u64
+  //
+  // Fail-closed stub for the M4-003 chunked decoder. The real
+  // body will run the state machine:
+  //
+  //   ST_SIZE     -> accumulate hex digits into cur_size; on CR
+  //                  transition to ST_SIZE_LF; on ';' refuse
+  //                  MALFORMED (chunk-ext scope cut).
+  //   ST_SIZE_LF  -> expect LF; refuse MALFORMED otherwise.
+  //                  If cur_size == 0 transition to ST_TRAIL_CR;
+  //                  else transition to ST_DATA with a countdown
+  //                  of cur_size bytes.
+  //   ST_DATA     -> copy the next cur_size input bytes verbatim
+  //                  to out; on countdown == 0 transition to
+  //                  ST_DATA_CR.
+  //   ST_DATA_CR  -> expect CR; refuse MALFORMED otherwise.
+  //   ST_DATA_LF  -> expect LF; refuse MALFORMED. Transition to
+  //                  ST_SIZE.
+  //   ST_TRAIL_CR -> expect CR (blank line -- no trailer-section
+  //                  accepted at v0.1.0); refuse MALFORMED for
+  //                  any other byte (which is where a real
+  //                  trailer-section would appear).
+  //   ST_TRAIL_LF -> expect LF; DONE.
+  //
+  // At every ST_SIZE transition the cumulative decoded byte
+  // count is checked against HTTPCH_TOTAL_MAX_BYTES; overrun
+  // returns HTTPCH_ERR_OVERSIZE. At every ST_SIZE_LF the parsed
+  // cur_size is checked against HTTPCH_CHUNK_MAX_BYTES; overrun
+  // returns HTTPCH_ERR_OVERSIZE.
+  //
+  // Returns the decoded byte count (small positive u64, bit 63
+  // clear) on success; (HTTPCH_ERR_* | HTTPCH_ERR_MASK) on
+  // failure.
+  // ==========================================================================
+  pub let net_http_chunked_decode_stub :
+    (u64, u64, u64, u64) -> u64 !{} @{} =
+    fn (in_va: u64, in_len: u64, out_va: u64, out_cap: u64) -> unsafe {
+      effects: {}, capabilities: {},
+      justification: "libpdx-net.M4-003 (#19): fail-closed stub for the chunked-transfer decoder. Returns (HTTPCH_ERR_MASK | HTTPCH_ERR_NOT_IMPL) = 0x800000000000003F via MOVABS (imm64 -- pdx-encoder pitfall: only MOVABS legal for `mov rax, imm64`). Four args ignored. Leaf, no memory, no stack. Labels prefixed libpdxnet_httpch_d_.",
+      block: {
+        mov rax, 0x800000000000003F;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // net_http_chunked_hex_digit(byte) -> u64
+  //
+  // Pure helper -- returns the numeric value (0..15) of an ASCII
+  // hex digit in the low nibble of rax; returns 0xFF for any
+  // non-hex byte so the M4-003 state machine can `cmp rax,
+  // 0xFF; je malformed` cleanly. Case-insensitive.
+  //
+  // This one IS a real body (not a stub) -- it is pure,
+  // ~30 instructions, and every future decoder pass will call
+  // it many times, so landing it now avoids a churn later.
+  //
+  // Layout:
+  //   '0'..'9'  -> byte - 0x30
+  //   'A'..'F'  -> byte - 0x37   (i.e. byte - 'A' + 10)
+  //   'a'..'f'  -> byte - 0x57   (i.e. byte - 'a' + 10)
+  //   anything  -> 0xFF
+  // ==========================================================================
+  pub let net_http_chunked_hex_digit : (u64) -> u64 !{} @{} =
+    fn (b: u64) -> unsafe {
+      effects: {}, capabilities: {},
+      justification: "libpdx-net.M4-003 (#19): pure ASCII-hex-to-nibble decoder, case-insensitive. Compares rdi against the four range endpoints (0x30/0x39 for digit, 0x41/0x46 for upper, 0x61/0x66 for lower); every endpoint is single-byte imm32 so no MOVABS staging. On match, subtracts the appropriate base offset (0x30 / 0x37 / 0x57) and returns. On no-match returns 0xFF (imm32). Uses cmp/jl / cmp/jg / jmp (not `test`) -- pdx-encoder pitfall avoided. Leaf, no memory, no stack. Labels prefixed libpdxnet_httpch_hex_.",
+      block: {
+        cmp rdi, 0x30;
+        jl  libpdxnet_httpch_hex_bad;
+        cmp rdi, 0x39;
+        jle libpdxnet_httpch_hex_digit;
+
+        cmp rdi, 0x41;
+        jl  libpdxnet_httpch_hex_bad;
+        cmp rdi, 0x46;
+        jle libpdxnet_httpch_hex_upper;
+
+        cmp rdi, 0x61;
+        jl  libpdxnet_httpch_hex_bad;
+        cmp rdi, 0x66;
+        jle libpdxnet_httpch_hex_lower;
+
+        mov rax, 0xFF;
+        ret;
+
+      libpdxnet_httpch_hex_digit:
+        mov rax, rdi;
+        sub rax, 0x30;
+        ret;
+
+      libpdxnet_httpch_hex_upper:
+        mov rax, rdi;
+        sub rax, 0x37;
+        ret;
+
+      libpdxnet_httpch_hex_lower:
+        mov rax, rdi;
+        sub rax, 0x57;
+        ret;
+
+      libpdxnet_httpch_hex_bad:
+        mov rax, 0xFF;
+        ret
+      }
+    }
+
+}

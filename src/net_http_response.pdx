@@ -1,0 +1,218 @@
+// src/net_http_response.pdx -- libpdx-net.M4-001 (libpdx-net#17)
+//
+// HTTP/1.1 status-line + header decode (response side).
+//
+// =============================================================================
+// SCOPE (design/networking/r100-user-tools-plan.md §2.5)
+// =============================================================================
+//
+// Parse the first two components of an HTTP/1.1 response into a
+// caller-provided fixed-layout struct:
+//
+//   1. Status line:  `HTTP/1.1 <status> <reason>\r\n`
+//      -> extract u16 status code + first-8-bytes of reason phrase
+//   2. Headers:      one or more `<name>: <value>\r\n`, ending with
+//                    the mandatory blank `\r\n` line
+//      -> extract Content-Length (if present, u64) + Transfer-
+//         Encoding (if present, one-byte enum: identity=0, chunked=1)
+//
+// Body-bytes decoding is either:
+//   * Content-Length-driven (M4-002 encode side / any GET with
+//     framed body) -- caller reads exactly N bytes after the
+//     header block.
+//   * Chunked (Transfer-Encoding: chunked) -- caller feeds body
+//     bytes through net_http_chunked.pdx (M4-003 / #19).
+//
+// This module's job stops at the blank line terminating the
+// header block. Body decode is the caller's business, with the
+// two u64 fields on the caller struct (parsed_content_length,
+// parsed_te_kind) telling it which shape to expect.
+//
+// =============================================================================
+// PARSED-RESPONSE STRUCT LAYOUT (64 bytes, caller-owned scratch)
+// =============================================================================
+//
+//   off  size  field                       notes
+//    0     8   parsed_status               u16 in low bits (200, 404, ...)
+//    8     8   parsed_reason_first8        first 8 ASCII bytes of the reason
+//                                          phrase, NUL-padded (best-effort;
+//                                          used only for diagnostic emit --
+//                                          no caller branches on it)
+//   16     8   parsed_content_length       0xFFFF_FFFF_FFFF_FFFF sentinel
+//                                          means "header not present"; any
+//                                          other value is a real length
+//                                          (u63 -- values >= 2^63 are
+//                                          refused as HTTP_ERR_DECODE)
+//   24     8   parsed_te_kind              0 = identity (no TE header
+//                                          present or `identity`), 1 =
+//                                          chunked, 0xFF = unknown (any
+//                                          other TE token; caller refuses)
+//   32     8   parsed_header_block_bytes   total header-block size in
+//                                          bytes, INCLUDING the terminating
+//                                          blank CRLF -- so caller can
+//                                          index into buf[block_bytes] for
+//                                          the first body byte
+//   40    24   reserved                    zeroed by init
+//
+// Total = 64 bytes (one cache line).
+//
+// =============================================================================
+// SIZE LIMITS
+// =============================================================================
+//
+//   * Status line max = HTTP_STATUS_LINE_MAX_BYTES (512).
+//   * Header line max = HTTP_HEADER_LINE_MAX_BYTES (512).
+//   * Header block total max = HTTP_HEADER_BLOCK_MAX_BYTES (8192).
+//
+// A response exceeding any of these fails with HTTP_ERR_DECODE.
+//
+// =============================================================================
+// STATUS-CODE FOLD DISCIPLINE
+// =============================================================================
+//
+// The parsed status is exposed as-is in parsed_status. The
+// caller decides whether to fold 4xx / 5xx into HTTP_ERR_STATUS_*
+// return codes or handle each family explicitly. This is
+// deliberately not done inside the parser: `pdxcurl` wants to
+// see the exact status (a 401 vs. a 403 vs. a 404 changes
+// its exit code per its own §4 point 7 taxonomy); folding here
+// would erase that.
+//
+// =============================================================================
+// paideia-as compliance
+// =============================================================================
+//
+//   - Module name PascalCase basename (`NetHttpResponse`) matches file.
+//   - Labels prefixed `libpdxnet_httpr_` -- disjoint from every other
+//     label prefix in this repo, avoids reserved keywords.
+//   - No `test rN, rN` -- cmp/je only (encoder pitfall).
+//   - Only 3-operand `imul r,r,imm` if used (none in this file).
+
+module NetHttpResponse = structure {
+
+  // === Response-struct offsets + widths ====================================
+  pub let HTTPR_STRUCT_BYTES              : u64 = 64
+  pub let HTTPR_OFF_STATUS                : u64 =  0
+  pub let HTTPR_OFF_REASON_FIRST8         : u64 =  8
+  pub let HTTPR_OFF_CONTENT_LENGTH        : u64 = 16
+  pub let HTTPR_OFF_TE_KIND               : u64 = 24
+  pub let HTTPR_OFF_HEADER_BLOCK_BYTES    : u64 = 32
+  pub let HTTPR_OFF_RESERVED              : u64 = 40
+  pub let HTTPR_RESERVED_BYTES            : u64 = 24
+
+  // === Sentinel + enum values ==============================================
+  //
+  // "Content-Length header not present" -- distinct from a real
+  // length of zero (which is legal, e.g. a 204 No Content
+  // response). MOVABS-loaded on read; a caller checks with
+  // `cmp cl, sentinel` against a staged r11 (imm32 sign-extend
+  // rules out a direct cmp).
+  pub let HTTPR_CL_SENTINEL_MISSING       : u64 = 0xFFFFFFFFFFFFFFFF
+
+  pub let HTTPR_TE_IDENTITY               : u64 = 0
+  pub let HTTPR_TE_CHUNKED                : u64 = 1
+  pub let HTTPR_TE_UNKNOWN                : u64 = 0xFF
+
+  // === Size caps ===========================================================
+  pub let HTTPR_STATUS_LINE_MAX_BYTES     : u64 =  512
+  pub let HTTPR_HEADER_LINE_MAX_BYTES     : u64 =  512
+  pub let HTTPR_HEADER_BLOCK_MAX_BYTES    : u64 = 8192
+
+  // === Header-name literals we branch on ===================================
+  //
+  // Case-insensitive on decode per RFC 9110 -- the real body
+  // will fold the incoming header name to lowercase before
+  // compare so a server that ships `content-length` (all lower)
+  // parses identically to one that ships `Content-Length`
+  // (title case). The lowercase-baseline forms live here.
+  pub let HTTPR_HDR_CONTENT_LENGTH_LC  : [u8; 15] = "content-length\0"
+  pub let HTTPR_HDR_TRANSFER_ENC_LC    : [u8; 18] = "transfer-encoding\0"
+  pub let HTTPR_TE_TOKEN_CHUNKED_LC    : [u8;  8] = "chunked\0"
+  pub let HTTPR_TE_TOKEN_IDENTITY_LC   : [u8;  9] = "identity\0"
+
+  // === Error aliases (from NetTypes.HttpErr band) ==========================
+  pub let HTTPR_OK             : u64 = 0x30
+  pub let HTTPR_ERR_DECODE     : u64 = 0x32
+  pub let HTTPR_ERR_NOT_IMPL   : u64 = 0x3F
+  pub let HTTPR_ERR_MASK       : u64 = 0x8000000000000000
+
+  // ==========================================================================
+  // net_http_response_init(resp_va) -> u64
+  //
+  // Zero-fill a caller-owned 64-byte response struct + stamp
+  // sentinels: parsed_content_length = HTTPR_CL_SENTINEL_MISSING,
+  // parsed_te_kind = HTTPR_TE_IDENTITY, everything else 0. Must
+  // be called BEFORE net_http_response_parse_stub -- the parser
+  // otherwise reads uninitialized sentinel state.
+  //
+  // Returns 0 on success; HTTPR_ERR_DECODE on null resp_va.
+  // ==========================================================================
+  pub let net_http_response_init : (u64) -> u64 !{mem} @{} =
+    fn (resp_va: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "libpdx-net.M4-001 (#17): zero-fill + sentinel-stamp for the caller-owned 64-byte response struct. Eight qword zeros (rax=0 via xor) at offsets 0/8/16/24/32/40/48/56, then MOVABS-stage HTTPR_CL_SENTINEL_MISSING (0xFFFFFFFFFFFFFFFF, exceeds imm32) into r10 and store to [resp+16]. parsed_te_kind at offset 24 stays 0 (== HTTPR_TE_IDENTITY, the correct default). cmp/je gate for null resp (not `test`). Leaf, eight memory writes, no stack. Labels prefixed libpdxnet_httpr_i_.",
+      block: {
+        cmp rdi, 0;
+        je  libpdxnet_httpr_i_badbuf;
+        xor rax, rax;
+        mov [rdi +  0], rax;
+        mov [rdi +  8], rax;
+        mov [rdi + 16], rax;
+        mov [rdi + 24], rax;
+        mov [rdi + 32], rax;
+        mov [rdi + 40], rax;
+        mov [rdi + 48], rax;
+        mov [rdi + 56], rax;
+        mov r10, 0xFFFFFFFFFFFFFFFF;
+        mov [rdi + 16], r10;
+        xor rax, rax;
+        ret;
+      libpdxnet_httpr_i_badbuf:
+        mov rax, 0x32;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // net_http_response_parse_stub(buf_va, buf_len, resp_va) -> u64
+  //
+  // Fail-closed stub for M4-001's status-line + header-block
+  // parser. The real body will:
+  //
+  //   1. Locate CRLF at the end of the status line (< 512 bytes
+  //      from buf_va); refuse HTTP_ERR_DECODE on overflow or
+  //      malformed first line.
+  //   2. Parse `HTTP/1.1 ` prefix (exactly 9 bytes); refuse on
+  //      any other version.
+  //   3. Parse a 3-digit ASCII status code, fold to u16, store at
+  //      HTTPR_OFF_STATUS.
+  //   4. Copy up to 8 bytes of the reason phrase (skipping the
+  //      single SP after the status) into HTTPR_OFF_REASON_FIRST8;
+  //      NUL-pad short reasons.
+  //   5. Iterate header lines. On `content-length:` (case-fold),
+  //      parse the ASCII decimal into u64, store at
+  //      HTTPR_OFF_CONTENT_LENGTH; refuse values >= 2^63. On
+  //      `transfer-encoding: chunked` (case-fold), store
+  //      HTTPR_TE_CHUNKED at HTTPR_OFF_TE_KIND; on `identity`
+  //      or absent, leave HTTPR_TE_IDENTITY; on any other token,
+  //      store HTTPR_TE_UNKNOWN (caller decides whether to
+  //      refuse).
+  //   6. Stop at the blank `\r\n` line; store the total header-
+  //      block byte count (INCLUDING the blank line) at
+  //      HTTPR_OFF_HEADER_BLOCK_BYTES.
+  //
+  // Returns the header-block byte count as a small positive u64
+  // on success; (HTTPR_ERR_* | HTTPR_ERR_MASK) on failure.
+  // ==========================================================================
+  pub let net_http_response_parse_stub :
+    (u64, u64, u64) -> u64 !{} @{} =
+    fn (buf_va: u64, buf_len: u64, resp_va: u64) -> unsafe {
+      effects: {}, capabilities: {},
+      justification: "libpdx-net.M4-001 (#17): fail-closed stub for the HTTP/1.1 status-line + header-block parser. Returns (HTTPR_ERR_MASK | HTTPR_ERR_NOT_IMPL) = 0x800000000000003F via MOVABS. Three args ignored. Leaf, no memory, no stack. Labels prefixed libpdxnet_httpr_ps_.",
+      block: {
+        mov rax, 0x800000000000003F;
+        ret
+      }
+    }
+
+}

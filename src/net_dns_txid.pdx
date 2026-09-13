@@ -1,0 +1,217 @@
+// src/net_dns_txid.pdx -- libpdx-net.M3-006 (libpdx-net#16)
+//
+// Resolver transaction-ID randomization + response-ID verification.
+//
+// =============================================================================
+// SCOPE (design/networking/r100-user-tools-plan.md §2.3.1 + §13.1)
+// =============================================================================
+//
+// Non-negotiable even at v1: cryptographically random 16-bit
+// transaction ID per query, verified against the response ID
+// BEFORE trusting any answer. Minimum bar against off-path DNS
+// response spoofing (Kaminsky 2008). Cheap to get right at
+// initial implementation; expensive to retrofit once callers
+// depend on a predictable ID.
+//
+// Source of randomness -- v0.1.0 WEAK_ENTROPY_FALLBACK
+// ----------------------------------------------------
+// paideia-as does not yet expose a CSPRNG intrinsic at
+// process-start entropy. Per §2.3.1, "a fallback of
+// hpet_now_ns() ^ pid ^ small-counter is acceptable for R100 but
+// must be labeled WEAK_ENTROPY_FALLBACK in a code comment so a
+// future round can find and replace it before this tool is
+// exposed on anything but a lab network."
+//
+// This module implements exactly that fallback. Every call site
+// carrying a TXID (net_dns_txid_next, below) and every audit
+// record emitting one (DnsQueryRecord@0.1 -- txn_id field, out
+// of scope for this landing) surface WEAK_ENTROPY_FALLBACK by
+// name in their justifications so a future grep for the string
+// locates every affected call in one pass.
+//
+// SWAP SITE
+// ---------
+// When paideia-as exposes a real CSPRNG intrinsic (currently
+// unfiled, referenced as KIND_CSPRNG in caps.decl), the swap
+// replaces `net_dns_txid_next`'s hpet+pid+counter body with a
+// single call to that intrinsic + a mask to 16 bits. Callers do
+// not change: the function signature (`() -> u64`) stays the
+// same, and the return value's contract (a low-16 TXID) is
+// unchanged.
+//
+// VERIFY DISCIPLINE
+// -----------------
+// net_dns_txid_verify(sent, recv) -> u64 is the mandatory gate
+// on every net_resolve response path. It returns DNS_OK (0x10) on
+// match and DNS_ERR_TXID_MISMATCH (0x15) on mismatch. Only the
+// low 16 bits of each argument are compared (DNS wire IDs are
+// u16; higher bits are ignored, matching the DnsQueryRecord@0.1
+// txn_id field's u16 shape). A caller that folds `net_resolve`
+// return codes through the DnsErr band therefore surfaces
+// spoofing attempts as a first-class error, distinct from
+// MALFORMED_RESPONSE (which would fold every parse fault into
+// the same channel and lose the spoofing signal).
+//
+// =============================================================================
+// paideia-as compliance
+// =============================================================================
+//
+//   - Module name PascalCase basename (`NetDnsTxid`) matches file.
+//   - Labels prefixed `libpdxnet_txid_` -- disjoint from every other
+//     label prefix in this repo, avoids reserved keywords.
+//   - No `test rN, rN` -- cmp/je only (encoder pitfall).
+//   - Every immediate > 0x7FFFFFFF stages through a register first;
+//     the DNS band values (0x10/0x15) are single-byte imm32.
+//   - Only 3-operand `imul r,r,imm` if used (none in this file).
+//   - No multi-line string literals (`pub let PDX_TOOL_NAME` in
+//     tool_ident.pdx is single-line; every constant here is a bare
+//     u64 immediate).
+
+module NetDnsTxid = structure {
+
+  // === Return-code aliases (from NetTypes.DnsErr band) =====================
+  //
+  // Duplicated as bare u64 constants here so this file assembles
+  // cleanly in per-file `paideia-as build --emit elf64` mode
+  // without needing cross-module symbol resolution. Values MUST
+  // agree with net_types.pdx -- if either constant changes, the
+  // other one changes too (grep for the literal 0x10 / 0x15).
+  pub let TXID_DNS_OK           : u64 = 0x10   // == NetTypes.DNS_OK
+  pub let TXID_ERR_MISMATCH     : u64 = 0x15   // == NetTypes.DNS_ERR_TXID_MISMATCH
+
+  // === WEAK_ENTROPY_FALLBACK counter =======================================
+  //
+  // Per §2.3.1: hpet_now_ns() ^ pid ^ small-counter. The counter
+  // is a process-scoped monotonic u64 that increments on every
+  // net_dns_txid_next call so two calls at the same HPET tick
+  // still produce distinct pre-mask values. Zero-initialized by
+  // .bss; the first-call value is (hpet ^ pid ^ 0), which is
+  // fine -- collision probability at v0.1.0 is dominated by the
+  // 16-bit truncation, not the counter's starting value.
+  pub let mut _net_dns_txid_counter : u64 = 0
+
+  // ==========================================================================
+  // net_dns_txid_next() -> u64
+  //
+  // Returns a fresh 16-bit TXID in the low bits of rax; high bits
+  // zeroed. Composes the value as:
+  //
+  //     (hpet_now_ns() ^ sys_getpid() ^ _net_dns_txid_counter) & 0xFFFF
+  //
+  // WEAK_ENTROPY_FALLBACK -- see file-header note. hpet_now_ns is
+  // called first (returns u64 ns in rax), then sys_getpid, and
+  // the intermediate value is stashed on the stack across the
+  // second call. r12 (callee-save) holds the running xor
+  // accumulator so no live value spans across sys_getpid.
+  //
+  // Alignment discipline: entry rsp%16 == 8; one push r12 + one
+  // 8-byte pad = 16 bytes -> nested CALLs see rsp%16 == 0.
+  //
+  // Return: u64 with the TXID in bits [0..15]; bits [16..63] are
+  // guaranteed zero. Callers pack directly into the DNS header
+  // ID field (2 bytes network-order).
+  // ==========================================================================
+  pub let net_dns_txid_next : () -> u64 !{mem} @{boot} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {boot},
+      justification: "libpdx-net.M3-006 (#16): WEAK_ENTROPY_FALLBACK TXID generator per plan §2.3.1. Composes (hpet_now_ns ^ sys_getpid ^ counter) & 0xFFFF; the counter is a process-scoped monotonic u64 that increments on every call so two calls at the same HPET tick still diverge. Stack layout: one push r12 (callee-save xor accumulator) + one 8-byte pad = 16 bytes; entry rsp%16 == 8 -> nested CALLs see rsp%16 == 0. r12 holds the running xor accumulator across sys_getpid so its rax return can fold in without a spill. Counter increment is a plain memory RMW (load into r10, inc, store) -- no atomic RMW needed at v0.1.0 (paideia-os user tools are single-threaded per §0.3). 0xFFFF is a small imm32 so the final `and rax, 0xFFFF` needs no MOVABS staging. Capability {boot} propagates from hpet_now_ns's own {boot} annotation. Labels prefixed libpdxnet_txid_n_.",
+      block: {
+        push r12;
+        sub  rsp, 8;
+
+        call hpet_now_ns;              // rax = ns
+        mov  r12, rax;                 // r12 = ns
+
+        call sys_getpid;               // rax = pid
+        xor  r12, rax;                 // r12 = ns ^ pid
+
+        lea  r10, [rip + _net_dns_txid_counter];
+        mov  r11, [r10 + 0];           // r11 = counter
+        inc  r11;
+        mov  [r10 + 0], r11;           // counter++
+        xor  r12, r11;                 // r12 = ns ^ pid ^ counter
+
+        mov  rax, r12;
+        and  rax, 0xFFFF;              // truncate to 16 bits
+
+        add  rsp, 8;
+        pop  r12;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // net_dns_txid_verify(sent, recv) -> u64
+  //
+  // Compares the low 16 bits of `sent` (the TXID originally
+  // handed to the request encoder) against the low 16 bits of
+  // `recv` (the ID field parsed from the DNS response header).
+  // Returns TXID_DNS_OK (0x10) on match, TXID_ERR_MISMATCH
+  // (0x15) on mismatch. Only the low 16 bits matter; higher
+  // bits in either argument are masked out and ignored, matching
+  // the wire's u16 shape.
+  //
+  // This is the mandatory gate on every net_resolve response
+  // path. A response that fails this check MUST be dropped
+  // BEFORE any further parsing -- an attacker who guesses even
+  // one non-TXID field (rcode, ancount) could otherwise poison a
+  // cache via a downstream parser that trusted the response
+  // structure. §2.3.1 is explicit about this ordering.
+  //
+  // Leaf function -- no stack, no callee-save writes, no
+  // syscalls.
+  // ==========================================================================
+  pub let net_dns_txid_verify : (u64, u64) -> u64 !{} @{} =
+    fn (sent: u64, recv: u64) -> unsafe {
+      effects: {}, capabilities: {},
+      justification: "libpdx-net.M3-006 (#16): mandatory pre-parse gate on DNS response TXID. Both args masked to 16 bits via `and r,0xFFFF` (small imm32 -- no MOVABS staging); compared via cmp/je (not `test rN,rN` -- encoder pitfall). Return values 0x10 / 0x15 are small imm32. Leaf -- no stack, no callee-save, no syscall. Labels prefixed libpdxnet_txid_v_.",
+      block: {
+        and rdi, 0xFFFF;
+        and rsi, 0xFFFF;
+        cmp rdi, rsi;
+        je  libpdxnet_txid_v_ok;
+        mov rax, 0x15;                 // DNS_ERR_TXID_MISMATCH
+        ret;
+      libpdxnet_txid_v_ok:
+        mov rax, 0x10;                 // DNS_OK
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // net_dns_txid_write_header_id(hdr_va, txid) -> u64
+  //
+  // Convenience: writes the 16-bit TXID at offset 0 of a
+  // caller-owned DNS header buffer in NETWORK byte order (RFC
+  // 1035 §4.1.1 -- ID is the first two bytes, big-endian).
+  // paideia-as is little-endian native; the write splits the
+  // low byte first then the high byte so the wire order is
+  // preserved without a bswap intrinsic.
+  //
+  // Returns 0 on success; TXID_ERR_MISMATCH (0x15) is reused
+  // as a bad-buf sentinel here since the DnsErr band has no
+  // dedicated INVALID_BUF code and this path is genuinely one
+  // of "the request ID cannot be trusted" -- a null-buf write
+  // means the caller's request was never composed and no
+  // matching response can arrive.
+  // ==========================================================================
+  pub let net_dns_txid_write_header_id : (u64, u64) -> u64 !{mem} @{} =
+    fn (hdr_va: u64, txid: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "libpdx-net.M3-006 (#16): pack a 16-bit TXID into offset 0 of a DNS header buffer in NETWORK (big-endian) byte order. paideia-as is little-endian native; two byte-writes (`mov [hdr+0], high; mov [hdr+1], low`) get the wire order right without a byte-swap intrinsic. High byte = (txid >> 8) & 0xFF (staged via `mov rax, rsi; shr rax, 8`); low byte = txid & 0xFF. Uses cmp/je gate for the null-buf refusal (not `test`). Sil register aliases rsi[0..7]; ax aliases rax[0..15]. Leaf, two byte-writes, no stack. Labels prefixed libpdxnet_txid_w_.",
+      block: {
+        cmp rdi, 0;
+        je  libpdxnet_txid_w_badbuf;
+        mov rax, rsi;
+        shr rax, 8;
+        mov [rdi + 0], al;             // high byte first (network order)
+        and rsi, 0xff; mov_b [rdi + 1], rsi;            // low byte second
+        xor rax, rax;
+        ret;
+      libpdxnet_txid_w_badbuf:
+        mov rax, 0x15;
+        ret
+      }
+    }
+
+}

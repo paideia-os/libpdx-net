@@ -1,0 +1,58 @@
+# libpdx-net -- paideia-as build manifest
+#
+# Wave:      R100  (client-side network SDK for PaideiaOS user tools)
+# Milestone: Wave N scaffold seed -- M3-005/006 + M4-001/002/003 land
+#            per-file pure-function schemas and encoders/decoders on
+#            top of a fresh scaffold (README + LICENSE + this manifest).
+# Doc:       design/networking/r100-user-tools-plan.md
+#            (paideia-os monorepo) -- authoritative for API surface
+#            (§2.1), TXID discipline (§2.3.1), TLS handshake record
+#            wire format (§10.3), and HTTP/1.1 encode/decode scope
+#            (§2.5). Milestone catalog at §13.1.
+#
+# The v0.1.0 scaffold seed intentionally ships stubs / pure functions
+# / schema constants only: real socket + TLS handshake bodies are
+# blocked on R100-PREP-002 (UDP-via-socket) and R100-PREP-005 (crypto
+# intrinsics -- SHA-256/HKDF/X25519/Ed25519). Every function in this
+# tag is either (a) a schema/offset constant module, (b) a pure
+# function over caller-provided byte buffers, or (c) a fail-closed
+# stub with a documented swap site once the upstream primitive lands
+# -- the mkfs.pdxfs pattern (parses, does not transmit, ships anyway).
+
+name        = libpdx-net
+version     = 0.1.0
+kind        = shared-library
+output      = build-out/libpdx-net.a
+caps_decl   = caps.decl
+
+# --- Source list -------------------------------------------------------
+# Order-insensitive; paideia-as resolves module deps from
+# `module <Basename> = structure { ... }` headers.
+sources:
+  - src/tool_ident.pdx          # PDX_TOOL_NAME / PDX_TOOL_VERSION externs
+  - src/net_types.pdx           # NetErr/DnsErr/TlsErr/HttpErr enum tags
+  - src/net_tls_record.pdx      # M3-005: TlsHandshakeRecord@0.1 schema + emit (#15)
+  - src/net_dns_txid.pdx        # M3-006: resolver TXID randomize + verify (#16)
+  - src/net_http_request.pdx    # M4-001 GET encode + M4-002 POST encode (#17/#18)
+  - src/net_http_response.pdx   # M4-001 status-line + header decode (#17)
+  - src/net_http_chunked.pdx    # M4-003 chunked transfer-encoding decode (#19)
+
+# --- Library dependencies ---------------------------------------------
+# libpdx-net at v0.1.0 depends on nothing outside the SC+ syscall
+# floor. libpdx-audit is a soft dep (semantic-pipe emission target
+# for TlsHandshakeRecord@0.1) -- the call is fronted by a local
+# stub (net_tls_record_emit_stub) that keeps a stable ABI at the
+# emission site; the real libpdx-audit satellite wire lands at a
+# future minor bump once the schema is registered with the daemon.
+deps: []
+
+# --- Test targets ------------------------------------------------------
+# Unit tests over the pure encoder/decoder halves land at M4-close
+# (issues #17/#18/#19 test-vector sub-issues yet to be filed). No
+# QEMU-substrate smokes at v0.1.0 -- pdxcurl / pdxdig / pdxsock
+# smokes at their own R100.M4 milestones cover the integration.
+tests: []
+
+# --- Documentation targets --------------------------------------------
+# .pdxdoc source lands at M5-001 alongside the first signed release.
+docs: []

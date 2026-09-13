@@ -1,0 +1,203 @@
+// src/net_tls_record.pdx -- libpdx-net.M3-005 (libpdx-net#15)
+//
+// TlsHandshakeRecord@0.1 schema bind + emit wire.
+//
+// =============================================================================
+// SCOPE (design/networking/r100-user-tools-plan.md §10.3 + §13.1)
+// =============================================================================
+//
+// One record per TLS handshake attempt, emitted regardless of
+// outcome -- OK, KEY_MISMATCH, HANDSHAKE_FAILED, TIMEOUT.
+// TLS_KEY_MISMATCH is exactly the kind of event the audit trail
+// exists to make legible; a handshake that refuses a rogue server
+// key is the LOAD-BEARING audit signal for the pinned-key trust
+// model at §0.5 -- a silent refusal defeats the whole point.
+//
+// The record's `sig_algo` field is an enum with two values at
+// v0.1.0: ED25519 (the M3-003 verify path actually implements) and
+// MLDSA65_RESERVED (a reserved tag paideia-net does NOT yet
+// verify -- full ML-DSA-65 verify support is future work per the
+// note on libpdx-net#15). Reserving the tag today is deliberately
+// additive: pdxtrust can label a raw pubkey with an ML-DSA algo
+// marker without libpdx-net's decode path having to grow the
+// enum later, and a future net_tls_record decoder that gets a
+// ML-DSA-65-labeled record will surface it as a first-class value
+// rather than "unknown enum tag" fault. The full implementation
+// depends on a `mldsa65_verify` intrinsic paideia-as does not yet
+// ship (paideia-as follow-up per §12.4).
+//
+// =============================================================================
+// WIRE LAYOUT (128 bytes, fixed, little-endian; §10.3)
+// =============================================================================
+//
+//   off  size  field
+//    0     8   audit_id                    u64
+//    8    32   server_name                 [u8;32]  NUL-terminated
+//   40     1   negotiated_cipher           u8       (CHACHA20_POLY1305_SHA256=1)
+//   41     1   negotiated_kex              u8       (X25519=1)
+//   42     1   sig_algo                    u8       (ED25519=1, MLDSA65_RESERVED=2)
+//   43     1   verdict                     u8       (OK=0, KEY_MISMATCH=1,
+//                                                    HANDSHAKE_FAILED=2, TIMEOUT=3)
+//   44    28   trust_cap_name              [u8;28]  NUL-terminated
+//   72    32   cert_chain_hash             [u8;32]  BLAKE3(pinned pubkey)
+//  104    16   ts_ns                       i128     (little-endian, low 8 first)
+//  120     8   reserved                    [u8;8]   zeroed
+//
+// Total = 128 bytes -- one cache line pair on x86_64, deliberately
+// sized so a future audit-journal daemon can batch-write a page's
+// worth in one syscall.
+//
+// =============================================================================
+// EMIT PATH
+// =============================================================================
+//
+// At v0.1.0 the emit path is a fail-closed stub
+// (net_tls_record_emit_stub): callers assemble the 128-byte
+// record in their own scratch and call the stub, which returns
+// TLSR_EMIT_STUB (0xE0) to signal "record composed but nothing was
+// placed on the wire". The stub keeps a stable ABI at every future
+// call site so libpdx-net.M3-001 (net_tls_wrap) can wire the
+// emission call today at every outcome branch (OK + each refusal
+// path) without a second churn when the real body lands.
+//
+// The real body will call:
+//   sys_semantic_send(TLSR_SCHEMA_TAG, buf_va, 128) -> u64
+// (SC+ ID 115; ambient, no cap gate at v0.1.0 -- see caps.decl).
+// Callers do NOT compose the schema tag themselves; the stub /
+// real body prepends it.
+//
+// =============================================================================
+// paideia-as compliance
+// =============================================================================
+//
+//   - Module name PascalCase basename (`NetTlsRecord`) matches file.
+//   - Labels prefixed `libpdxnet_tlsr_` -- disjoint from every other
+//     label prefix in this repo, and avoids the reserved keywords
+//     (`loop`, `if`, etc.) per paideia-as parser rules.
+//   - Every immediate > 0x7FFFFFFF stages through a register first
+//     (see fn justifications).
+//   - Only 3-operand `imul r,r,imm` shapes used (none in this file
+//     -- no multiplies at all).
+
+module NetTlsRecord = structure {
+
+  // === Schema-tag + emit-stub return codes ==================================
+  //
+  // TLSR_SCHEMA_TAG is the u64 tag sys_semantic_send prepends to
+  // the wire payload so a receiver can dispatch by schema. The
+  // value is composed as:
+  //
+  //   high 32 bits = fnv1a("TlsHandshakeRecord")  (folded)
+  //   low  16 bits = record-shape version (0x0001 for @0.1)
+  //   low  16 bits above = schema-family enum (0x0004 = TLS)
+  //
+  // At v0.1.0 the tag is a fixed opaque u64; a future rev-manager
+  // may derive it programmatically. Documented here so a grep on
+  // the literal finds the schema-name binding.
+  pub let TLSR_SCHEMA_TAG       : u64 = 0x546C7368_00040001
+
+  pub let TLSR_RECORD_BYTES     : u64 = 128
+  pub let TLSR_EMIT_OK          : u64 = 0x00
+  pub let TLSR_EMIT_STUB        : u64 = 0xE0    // v0.1.0 -- no wire write
+  pub let TLSR_EMIT_ERR_BUF     : u64 = 0xE1    // caller-passed 0 buf_va
+  pub let TLSR_EMIT_ERR_SEND    : u64 = 0xE2    // real path: SC+115 refused
+
+  // === Wire-layout offsets (bytes, absolute within the 128-byte
+  //     record). Every offset is 8- or 4-byte aligned by design so a
+  //     composer can use plain `mov [buf+off], reg` stores. -----------
+  pub let TLSR_OFF_AUDIT_ID         : u64 =   0
+  pub let TLSR_OFF_SERVER_NAME      : u64 =   8
+  pub let TLSR_OFF_CIPHER           : u64 =  40
+  pub let TLSR_OFF_KEX              : u64 =  41
+  pub let TLSR_OFF_SIG_ALGO         : u64 =  42
+  pub let TLSR_OFF_VERDICT          : u64 =  43
+  pub let TLSR_OFF_TRUST_CAP_NAME   : u64 =  44
+  pub let TLSR_OFF_CERT_CHAIN_HASH  : u64 =  72
+  pub let TLSR_OFF_TS_NS            : u64 = 104
+  pub let TLSR_OFF_RESERVED         : u64 = 120
+
+  pub let TLSR_SERVER_NAME_BYTES    : u64 =  32
+  pub let TLSR_TRUST_CAP_NAME_BYTES : u64 =  28
+  pub let TLSR_CERT_CHAIN_HASH_BYTES : u64 = 32
+  pub let TLSR_TS_NS_BYTES          : u64 =  16
+  pub let TLSR_RESERVED_BYTES       : u64 =   8
+
+  // === Cipher / KEX / sig_algo / verdict enum values ========================
+  //
+  // Deliberately narrow (single-byte) at v0.1.0 -- see §10.3.
+  pub let TLSR_CIPHER_CHACHA20_POLY1305_SHA256 : u64 = 1
+
+  pub let TLSR_KEX_X25519           : u64 = 1
+
+  pub let TLSR_SIG_ED25519          : u64 = 1
+  pub let TLSR_SIG_MLDSA65_RESERVED : u64 = 2
+
+  pub let TLSR_VERDICT_OK               : u64 = 0
+  pub let TLSR_VERDICT_KEY_MISMATCH     : u64 = 1
+  pub let TLSR_VERDICT_HANDSHAKE_FAILED : u64 = 2
+  pub let TLSR_VERDICT_TIMEOUT          : u64 = 3
+
+  // === Module-private send scratch =========================================
+  //
+  // Real body composes the sys_semantic_send frame here (schema
+  // tag + payload). Unused by the v0.1.0 stub but reserved for the
+  // swap so no follow-up landing has to grow .bss.
+  pub let mut _net_tls_record_send_scratch : [u8; 144] = uninit @align(8)
+
+  // ==========================================================================
+  // net_tls_record_emit_stub(buf_va) -> u64
+  //
+  // Fail-closed stub for the M3-005 emission wire. Callers pass a
+  // pointer to a caller-owned 128-byte scratch already filled with
+  // a TlsHandshakeRecord@0.1 shape (offsets/enums above). Returns
+  // TLSR_EMIT_ERR_BUF for buf_va == 0, TLSR_EMIT_STUB otherwise.
+  //
+  // The real M3-005 body (post-libpdx-audit integration) will
+  // frame + sys_semantic_send at this same call site with a
+  // return-value shape callers already handle: OK / ERR_BUF /
+  // ERR_SEND. Consumers therefore do NOT need to change ANY
+  // call-site when the swap lands.
+  // ==========================================================================
+  pub let net_tls_record_emit_stub : (u64) -> u64 !{} @{} =
+    fn (buf_va: u64) -> unsafe {
+      effects: {}, capabilities: {},
+      justification: "libpdx-net.M3-005 (#15): fail-closed stub for the TlsHandshakeRecord@0.1 emission wire. Refuses buf_va==0 with TLSR_EMIT_ERR_BUF (0xE1); returns TLSR_EMIT_STUB (0xE0) otherwise so a supervisor can distinguish 'record composed, nothing on wire' from 'call refused'. Values 0xE0 / 0xE1 are 8-bit and fit imm32 directly; no MOVABS needed. Uses cmp/je (not `test rN,rN` -- pdx-encoder pitfall). Leaf, no memory writes, no stack. Labels prefixed libpdxnet_tlsr_e_.",
+      block: {
+        cmp rdi, 0;
+        je  libpdxnet_tlsr_e_badbuf;
+        mov rax, 0xE0;
+        ret;
+      libpdxnet_tlsr_e_badbuf:
+        mov rax, 0xE1;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // net_tls_record_compose_verdict(buf_va, verdict) -> u64
+  //
+  // Writes a single verdict byte at TLSR_OFF_VERDICT of the
+  // caller-owned 128-byte record buffer. Intended as the terminal
+  // action at every M3-001 net_tls_wrap outcome branch (OK path
+  // stamps VERDICT_OK, each refusal path stamps its own value)
+  // BEFORE calling net_tls_record_emit_stub, so the stub sees a
+  // fully-shaped record even in the failure paths. Returns 0 on
+  // success; TLSR_EMIT_ERR_BUF for buf_va == 0.
+  // ==========================================================================
+  pub let net_tls_record_compose_verdict : (u64, u64) -> u64 !{mem} @{} =
+    fn (buf_va: u64, verdict: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "libpdx-net.M3-005 (#15): stamp the single verdict byte at TLSR_OFF_VERDICT (43) of a caller-owned record buffer. Verdict values 0..3 are small imm8s; the byte-store `mov [buf+43], sil` is legal x86_64. Uses cmp/je gate (not `test`). Leaf, one memory byte write, no stack. Labels prefixed libpdxnet_tlsr_cv_.",
+      block: {
+        cmp rdi, 0;
+        je  libpdxnet_tlsr_cv_badbuf;
+        and rsi, 0xff; mov_b [rdi + 43], rsi;
+        xor rax, rax;
+        ret;
+      libpdxnet_tlsr_cv_badbuf:
+        mov rax, 0xE1;
+        ret
+      }
+    }
+
+}

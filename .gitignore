@@ -1,0 +1,11 @@
+build-out/
+*.o
+*.elf
+*.pdxdoc.bin
+
+# Editor/OS junk
+.DS_Store
+*.swp
+*~
+.vscode/
+.idea/

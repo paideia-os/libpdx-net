@@ -1,0 +1,240 @@
+// src/net_http_request.pdx -- libpdx-net.M4-001 + M4-002
+// Issues: libpdx-net#17 (GET encode + response decode) --
+//         encode half here; response half in net_http_response.pdx.
+//         libpdx-net#18 (POST encode + Content-Length body).
+//
+// =============================================================================
+// SCOPE (design/networking/r100-user-tools-plan.md §2.5)
+// =============================================================================
+//
+// Request-line + header encode for HTTP/1.1 requests, over either
+// a `net_tls_wrap`ped connection (HTTPS) or a bare `net_connect`ed
+// one (HTTP). Two variants:
+//
+//   M4-001 GET  ->  assemble `GET <path> HTTP/1.1\r\n
+//                             Host: <host>\r\n
+//                             \r\n`
+//   M4-002 POST ->  assemble `POST <path> HTTP/1.1\r\n
+//                             Host: <host>\r\n
+//                             Content-Length: <N>\r\n
+//                             \r\n<body>`
+//
+// The scope is deliberately narrow at v0.1.0:
+//
+//   * Request URL parse (scheme / host / port / path split) is
+//     the sibling libpdx-url library's job (RFC 3986 -- see
+//     issues on paideia-os/libpdx-url). The encoder here takes
+//     already-split host + path strings.
+//   * NO custom-header injection at v0.1.0. Every request ships
+//     with exactly two headers on encode: Host (always) and,
+//     for POST, Content-Length. `pdxcurl -H` is a future add
+//     (issue TBD on pdxcurl).
+//   * NO chunked REQUEST bodies. §2.5 is explicit: "Encode side
+//     only ever sends Content-Length (no chunked request bodies
+//     at v1 -- pdxcurl --data always knows its length up front)."
+//     Chunked decode (response side) lives in net_http_chunked.pdx.
+//   * NO redirect handling here -- that is M4-004 (libpdx-net#20)
+//     in a separate module.
+//   * NO connection reuse layer here -- HttpClient handle lives
+//     one level up.
+//
+// =============================================================================
+// WIRE-FORMAT DISCIPLINE
+// =============================================================================
+//
+// HTTP/1.1 is text over the wire. Every literal byte the encoder
+// stamps into a request buffer is spelled out in this file so a
+// future audit can grep-verify no ambiguous ASCII slipped in
+// (bare LF instead of CRLF, tab instead of space, ...). The
+// canonical ASCII constants for CR/LF/SP/COLON are declared once
+// at module scope and every encoder-write goes through them.
+//
+// Line terminator is CRLF (0x0D 0x0A) verbatim per RFC 9112
+// §2.2. Any HTTP/1.1 server that accepts bare LF is a lenient
+// implementation; libpdx-net does NOT accept bare LF on decode
+// (see net_http_response.pdx) so encoding one here would be
+// asymmetric and would misrepresent what we accept.
+//
+// Header-field-name case is preserved verbatim from the caller-
+// visible constants (`Host`, `Content-Length` -- both TitleCase
+// per RFC 9110's suggestion, though case-insensitive on the wire).
+//
+// =============================================================================
+// BUFFER OWNERSHIP + SIZE DISCIPLINE
+// =============================================================================
+//
+// The caller owns the output buffer and passes its capacity.
+// Every encoder returns:
+//
+//   >= 0     -> number of bytes actually written
+//   0xFFFF.. -> HTTP_ERR_* code (from NetTypes.HttpErr band)
+//
+// This dual-purpose return is the SAME shape as libpdx-argv's
+// parse loop uses; the discriminator is bit 63 (an error code
+// has bit 63 set by construction because HTTP_ERR_* values are
+// laid out in 0x30..0x3F but a caller who wants a hard type
+// discrimination should mask against HTTP_ERR_MASK below rather
+// than comparing bit ranges). The v0.1.0 stubs return
+// HTTP_ERR_NOT_IMPL (0x3F) for the composite encoders so no
+// caller can accidentally treat a stub call's return as a byte
+// count.
+//
+// Bounds: HTTP_REQUEST_MAX_BYTES (2048) is the largest request
+// this encoder will produce. A caller-supplied buffer smaller
+// than that is fine; a request that would exceed it (very long
+// path + very long host + a huge Content-Length header) returns
+// HTTP_ERR_ENCODE. Header-line total limit is 512 bytes per
+// RFC 9110 §5.4 recommendation.
+//
+// =============================================================================
+// paideia-as compliance
+// =============================================================================
+//
+//   - Module name PascalCase basename (`NetHttpRequest`) matches file.
+//   - Labels prefixed `libpdxnet_httpq_` -- disjoint from every other
+//     label prefix in this repo, avoids reserved keywords.
+//   - No `test rN, rN` -- cmp/je only (encoder pitfall).
+//   - Only 3-operand `imul r,r,imm` if used (none in this file).
+//   - String literals on single lines.
+//   - Array size == literal byte count INCLUDING every NUL.
+
+module NetHttpRequest = structure {
+
+  // === ASCII single-byte constants used by every encoder path ==============
+  pub let HTTP_ASCII_CR    : u64 = 0x0D
+  pub let HTTP_ASCII_LF    : u64 = 0x0A
+  pub let HTTP_ASCII_SP    : u64 = 0x20
+  pub let HTTP_ASCII_COLON : u64 = 0x3A
+  pub let HTTP_ASCII_SLASH : u64 = 0x2F
+
+  // === Method / version / mandatory-header literals =========================
+  //
+  // NUL-terminated for the fingerprint extractor + so a debug
+  // string-dump reads cleanly. The trailing NUL is NOT copied to
+  // the wire; the encoder always ends the request-line with CRLF.
+  pub let HTTP_METHOD_GET       : [u8; 4] = "GET\0"
+  pub let HTTP_METHOD_POST      : [u8; 5] = "POST\0"
+  pub let HTTP_VERSION_1_1      : [u8; 9] = "HTTP/1.1\0"
+  pub let HTTP_HEADER_HOST      : [u8; 5] = "Host\0"
+  pub let HTTP_HEADER_CONT_LEN  : [u8; 15] = "Content-Length\0"
+
+  // === Size caps (bytes) ===================================================
+  pub let HTTP_REQUEST_MAX_BYTES        : u64 = 2048
+  pub let HTTP_HEADER_LINE_MAX_BYTES    : u64 = 512
+  pub let HTTP_HOST_MAX_BYTES           : u64 = 255   // RFC 1035 label sum
+  pub let HTTP_PATH_MAX_BYTES           : u64 = 1024
+
+  // === Error / status aliases (from NetTypes.HttpErr band) =================
+  pub let HTTPQ_OK           : u64 = 0x30
+  pub let HTTPQ_ERR_ENCODE   : u64 = 0x31
+  pub let HTTPQ_ERR_NOT_IMPL : u64 = 0x3F
+
+  // High-bit-set error mask so a caller can distinguish
+  // "byte-count return" (bit 63 clear) from "error code return"
+  // (bit 63 set). Values in the HttpErr band (0x30..0x3F) do NOT
+  // have bit 63 set by default; the encoder ORs this mask in
+  // before returning an error so a caller's discriminator is
+  // trivial. Kept as its own constant so a future refactor can
+  // swap the discriminator scheme without touching every call
+  // site.
+  pub let HTTPQ_ERR_MASK : u64 = 0x8000000000000000
+
+  // ==========================================================================
+  // net_http_encode_get_stub(buf_va, buf_cap, host_va, host_len,
+  //                          path_va, path_len) -> u64
+  //
+  // Fail-closed stub for M4-001's GET request-line + Host header
+  // encoder. Returns HTTPQ_ERR_NOT_IMPL (0x3F) ORed with
+  // HTTPQ_ERR_MASK so a caller who forgets to guard against the
+  // stub gets an obvious sign-bit-set return rather than a small
+  // integer masquerading as a byte count.
+  //
+  // The real M4-001 body will stamp, in order:
+  //
+  //   1. "GET"                                 (from HTTP_METHOD_GET)
+  //   2. " "                                   (HTTP_ASCII_SP)
+  //   3. path bytes (verbatim, no url-decode)
+  //   4. " "                                   (HTTP_ASCII_SP)
+  //   5. "HTTP/1.1"                            (from HTTP_VERSION_1_1)
+  //   6. CRLF                                  (0x0D 0x0A)
+  //   7. "Host"                                (from HTTP_HEADER_HOST)
+  //   8. ": "                                  (COLON + SP)
+  //   9. host bytes (verbatim)
+  //  10. CRLF
+  //  11. CRLF (blank line terminator)
+  //
+  // and return the byte count of the request as a small positive
+  // u64 (bit 63 clear -- see HTTPQ_ERR_MASK note above).
+  // ==========================================================================
+  pub let net_http_encode_get_stub :
+    (u64, u64, u64, u64, u64, u64) -> u64 !{} @{} =
+    fn (buf_va: u64, buf_cap: u64,
+        host_va: u64, host_len: u64,
+        path_va: u64, path_len: u64) -> unsafe {
+      effects: {}, capabilities: {},
+      justification: "libpdx-net.M4-001 (#17): fail-closed stub for the GET request-line + Host header encoder. Returns (HTTPQ_ERR_NOT_IMPL | HTTPQ_ERR_MASK) = 0x800000000000003F -- bit 63 set discriminates it from any legitimate byte count. Loaded via MOVABS (imm64 exceeds imm32 -- pdx-encoder pitfall: `mov rax, imm64` is legal ONLY as MOVABS). Leaf, no memory, no stack. Six args ignored (rdi..r9). Labels prefixed libpdxnet_httpq_g_.",
+      block: {
+        mov rax, 0x800000000000003F;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // net_http_encode_post_stub(buf_va, buf_cap, host_va, host_len,
+  //                           path_va, path_len) -> u64
+  //
+  // Fail-closed stub for M4-002's POST request-line + Host +
+  // Content-Length header encoder. Six args identical to the GET
+  // stub (the body pointer and body length are read from a
+  // module-private slot -- see _net_http_post_body_va /
+  // _net_http_post_body_len -- since paideia-as user-tool
+  // functions cap at six SysV args). The real body will emit,
+  // after the M4-001 shape, the extra header:
+  //
+  //   "Content-Length: <N>\r\n\r\n"
+  //
+  // where <N> is the ASCII decimal representation of the body
+  // length (u64), and then append the body bytes verbatim after
+  // the blank-line terminator.
+  //
+  // No chunked request bodies per §2.5 -- pdxcurl --data always
+  // knows its length up front.
+  // ==========================================================================
+  pub let net_http_encode_post_stub :
+    (u64, u64, u64, u64, u64, u64) -> u64 !{} @{} =
+    fn (buf_va: u64, buf_cap: u64,
+        host_va: u64, host_len: u64,
+        path_va: u64, path_len: u64) -> unsafe {
+      effects: {}, capabilities: {},
+      justification: "libpdx-net.M4-002 (#18): fail-closed stub for the POST request-line + Host + Content-Length encoder. Same discriminator shape as the GET stub (HTTPQ_ERR_MASK | HTTPQ_ERR_NOT_IMPL = 0x800000000000003F, MOVABS). Body pointer + length threaded through _net_http_post_body_va / _net_http_post_body_len (module-private) so the six-arg SysV cap is not tripped; the real body reads them from those slots. Leaf, no memory, no stack. Labels prefixed libpdxnet_httpq_p_.",
+      block: {
+        mov rax, 0x800000000000003F;
+        ret
+      }
+    }
+
+  // === POST body threading slots (module-private) ==========================
+  //
+  // Set by net_http_encode_post_set_body BEFORE calling
+  // net_http_encode_post_stub. Read by the real M4-002 body once
+  // it lands. Two u64 slots: pointer + length; a NULL pointer is
+  // an empty body (Content-Length: 0), a non-zero pointer with a
+  // zero length is a caller-side bug (encoder returns
+  // HTTPQ_ERR_ENCODE).
+  pub let mut _net_http_post_body_va  : u64 = 0
+  pub let mut _net_http_post_body_len : u64 = 0
+
+  pub let net_http_encode_post_set_body : (u64, u64) -> () !{mem} @{} =
+    fn (body_va: u64, body_len: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "libpdx-net.M4-002 (#18): stash POST body pointer + length for the next net_http_encode_post_stub call. Two plain .bss writes (`lea r11, [rip + sym]; mov [r11], rdi/rsi`). Called-before-encode discipline is a caller contract, not enforced here. Leaf, two memory writes, no stack. Labels prefixed libpdxnet_httpq_sb_.",
+      block: {
+        lea r11, [rip + _net_http_post_body_va];
+        mov [r11 + 0], rdi;
+        lea r11, [rip + _net_http_post_body_len];
+        mov [r11 + 0], rsi;
+        ret
+      }
+    }
+
+}

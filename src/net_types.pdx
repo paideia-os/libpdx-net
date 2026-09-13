@@ -1,0 +1,91 @@
+// src/net_types.pdx -- libpdx-net v0.1.0 (Wave N scaffold seed)
+//
+// NetErr / DnsErr / TlsErr / HttpErr enum shapes. Per plan §2.1
+// these four are small closed enums (not a shared errno space) --
+// each layer's failure taxonomy is distinct and each maps
+// independently onto the semantic-pipe result-code fields at §10.
+//
+// Distinct 8-bit bands per layer so a caller who folds any error
+// through a single `u64` return-code slot can tell at a glance
+// which layer produced it -- and so a future audit-pipe consumer
+// can filter TLS-band errors from DNS-band errors without a
+// symbol table.
+//
+// Wire-format note: these values are process-local u64 return
+// codes. They are NOT wire-serialized into any semantic-pipe
+// record at v0.1.0 -- TlsHandshakeRecord@0.1's `verdict` field
+// (net_tls_record.pdx) uses its own compact single-byte enum
+// domain that maps onto the TLS_* band here at compose time.
+// A change here does not implicitly change the wire; a wire
+// bump is a separate schema-version decision.
+
+module NetTypes = structure {
+
+  // === NetErr band (0x00 -- 0x0F) ============================================
+  // Base socket-family failures: what a bare TCP/UDP call could
+  // fail on before either DNS or TLS gets involved.
+  pub let NET_OK                : u64 = 0x00
+  pub let NET_ERR_INVAL         : u64 = 0x01   // caller passed a bad arg
+  pub let NET_ERR_NOMEM         : u64 = 0x02   // no cap-table / fd-table slot
+  pub let NET_ERR_REFUSED       : u64 = 0x03   // peer sent RST / no listener
+  pub let NET_ERR_UNREACHABLE   : u64 = 0x04   // no route / net down
+  pub let NET_ERR_TIMEOUT       : u64 = 0x05   // send/recv exceeded deadline
+  pub let NET_ERR_CLOSED        : u64 = 0x06   // peer closed cleanly mid-op
+  pub let NET_ERR_SYSCALL       : u64 = 0x07   // underlying SC+ returned err
+  pub let NET_ERR_NOT_IMPL      : u64 = 0x0F   // stub -- real path not landed
+
+  // === DnsErr band (0x10 -- 0x1F) ============================================
+  // Resolver-layer failures: what net_resolve can surface once
+  // the query is on the wire (or before, on encode/decode).
+  pub let DNS_OK                : u64 = 0x10
+  pub let DNS_ERR_NXDOMAIN      : u64 = 0x11   // rcode 3 from server
+  pub let DNS_ERR_TIMEOUT       : u64 = 0x12   // no response inside 5s
+  pub let DNS_ERR_MALFORMED     : u64 = 0x13   // response failed decode
+  pub let DNS_ERR_UNSUPPORTED   : u64 = 0x14   // qtype not A/CNAME
+  pub let DNS_ERR_TXID_MISMATCH : u64 = 0x15   // response TXID != request
+                                                //   (M3-006 -- §2.3.1)
+  pub let DNS_ERR_SERVFAIL      : u64 = 0x16   // rcode 2
+  pub let DNS_ERR_REFUSED       : u64 = 0x17   // rcode 5
+  pub let DNS_ERR_CNAME_LOOP    : u64 = 0x18   // > 4 CNAME hops
+  pub let DNS_ERR_NOT_IMPL      : u64 = 0x1F   // stub -- real path not landed
+
+  // === TlsErr band (0x20 -- 0x2F) ============================================
+  // TLS 1.3 handshake + record-layer failures. Per §2.4 the
+  // scaffold seed ships the enum shape only; real handshake and
+  // record-layer bodies (M3-001..M3-004) are blocked on
+  // R100-PREP-005.
+  pub let TLS_OK                : u64 = 0x20
+  pub let TLS_ERR_KEY_MISMATCH  : u64 = 0x21   // server sig didn't verify
+                                                //   against pinned pubkey
+  pub let TLS_ERR_HANDSHAKE     : u64 = 0x22   // any structural handshake
+                                                //   failure (bad cipher,
+                                                //   bad extension, ...)
+  pub let TLS_ERR_TIMEOUT       : u64 = 0x23   // handshake deadline hit
+  pub let TLS_ERR_ALERT         : u64 = 0x24   // peer sent Alert
+  pub let TLS_ERR_BAD_RECORD    : u64 = 0x25   // AEAD open failed
+  pub let TLS_ERR_TRUST         : u64 = 0x26   // KIND_TLS_TRUST cap
+                                                //   unusable
+  pub let TLS_ERR_NOT_IMPL      : u64 = 0x2F   // stub -- real path not landed
+
+  // === HttpErr band (0x30 -- 0x3F) ===========================================
+  // HTTP/1.1 encode + decode failures. Distinct from TlsErr so a
+  // caller who runs `http_get` over TLS can tell "the TLS
+  // channel died" (TLS band) from "the server returned garbage"
+  // (HTTP band) without a second return slot.
+  pub let HTTP_OK               : u64 = 0x30
+  pub let HTTP_ERR_ENCODE       : u64 = 0x31   // request too large / bad url
+  pub let HTTP_ERR_DECODE       : u64 = 0x32   // status-line or header
+                                                //   didn't match RFC 9110
+  pub let HTTP_ERR_STATUS_4XX   : u64 = 0x33   // any 4xx (caller reads
+                                                //   parsed_status for
+                                                //   the exact code)
+  pub let HTTP_ERR_STATUS_5XX   : u64 = 0x34   // any 5xx (same rule)
+  pub let HTTP_ERR_TIMEOUT      : u64 = 0x35   // recv exceeded deadline
+  pub let HTTP_ERR_CHUNK_MALFORMED : u64 = 0x36  // M4-003 -- chunked
+                                                //   framing byte-level
+                                                //   parse error
+  pub let HTTP_ERR_CHUNK_OVERSIZE  : u64 = 0x37  // chunk size >
+                                                //   HTTP_CHUNK_MAX_BYTES
+  pub let HTTP_ERR_NOT_IMPL     : u64 = 0x3F   // stub -- real path not landed
+
+}

@@ -1,0 +1,63 @@
+# libpdx-net -- shared-library dependencies (per design/networking/
+# r100-user-tools-plan.md §2 + §12).
+#
+# Version:  authoritative for v0.1.0 (Wave N scaffold seed).
+#
+# Format:   <libname>  <version-constraint>  <status>  <notes>
+#
+# `status` is one of:
+#   LANDED   -- the dependency has shipped a signed release we consume
+#   PENDING  -- the dep exists as source but hasn't closed its M5 yet;
+#               libpdx-net wires to the kernel primitive the dep will
+#               eventually front, and the swap is source-compatible.
+#   KERNEL   -- not a shared library; kernel primitive consumed directly.
+#
+# A PENDING entry is a documented forward reference, not a build
+# blocker: every function that would go through the pending lib is
+# present today with a direct kernel-primitive call marked as the
+# swap site in the source.
+
+libpdx-audit    >=1.1.2   PENDING   TlsHandshakeRecord@0.1 emission
+                                    (M3-005, net_tls_record.pdx) mirrors
+                                    the record through libpdx-audit's
+                                    audit_append_leaf once the leaf's
+                                    schema-tag path grows a TLS variant.
+                                    At v0.1.0 the emit path is a stub
+                                    (net_tls_record_emit_stub) that
+                                    keeps a stable ABI at the emission
+                                    site; the swap adds a `deps:` line
+                                    in manifest.pdxproj + a caps.decl
+                                    `requires: KIND_IPC_ENDPOINT(write,
+                                    svc.audit-journal)` line + a body
+                                    swap in net_tls_record.pdx.
+
+libpdx-argv     >=1.1.3   PENDING   Wave 6 PDX_TOOL_NAME/PDX_TOOL_VERSION
+                                    extern contract (see
+                                    src/tool_ident.pdx). The scaffold
+                                    seed defines both externs today
+                                    even though no libpdx-net function
+                                    consumes libpdx-argv yet -- the
+                                    contract is symmetric with every
+                                    other user-space tool in this org
+                                    and the two symbols cost nothing
+                                    to publish preemptively.
+
+# Kernel primitives consumed directly (KERNEL -- not shared libraries):
+#
+#   sys_getpid                   -- SC+ ID 39; net_dns_txid.pdx v0.1.0
+#                                    WEAK_ENTROPY_FALLBACK path only
+#   sys_hpet_now_ns              -- SC+ ID 45; net_dns_txid.pdx v0.1.0
+#                                    WEAK_ENTROPY_FALLBACK path only
+#   sys_semantic_send            -- SC+ ID 115; TlsHandshakeRecord@0.1
+#                                    emit path (M3-005) once the stub
+#                                    lifts
+#   sys_socket / bind / listen / accept / connect / send / recv /
+#     shutdown / close           -- SC+ IDs 87..94, 3; NOT consumed at
+#                                    v0.1.0 (M2 wrappers not yet
+#                                    scaffolded here; see issues #4/#5)
+#   ChaCha20Poly1305::seal/open  -- paideia-as intrinsic
+#                                    (#1305/v0.33-004); NOT consumed at
+#                                    v0.1.0 (TLS record layer M3-004
+#                                    not yet scaffolded here; see #14)
+#
+# All of the above are ambient at v0.1.0 (no per-caller cap gate).

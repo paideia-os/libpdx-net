@@ -1,0 +1,83 @@
+# libpdx-net -- caps.decl
+#
+# Wave: R100 (v0.1.0 scaffold seed)
+# Doc:  design/networking/r100-user-tools-plan.md §2 + §10 + §12
+#       (paideia-os monorepo).
+#
+# libpdx-net is a shared library that will front the SC+ socket
+# family (SC+ 87..94 -- sys_socket / bind / listen / accept / connect
+# / send / recv / shutdown) plus the generic fd close (SC+ 3) for the
+# TCP/UDP wrappers, the same UDP path once R100-PREP-002 lands for
+# the resolver, and the ChaCha20-Poly1305 AEAD intrinsic (paideia-as
+# ChaCha20Poly1305::seal/open, landed #1305/v0.33-004) for the TLS
+# record layer. The scaffold seed (v0.1.0) consumes NONE of those
+# syscalls directly -- every function shipped is either a pure
+# transformation over caller-provided byte buffers or a fail-closed
+# stub whose real body will land after the R100 PREP items resolve.
+#
+# Two syscalls the scaffold seed DOES consume for the resolver TXID
+# path (M3-006, net_dns_txid.pdx):
+#
+#   * `sys_getpid` (SC+ ID 39) -- one bit of process-scoped entropy
+#     folded into the WEAK_ENTROPY_FALLBACK TXID (per plan §2.3.1;
+#     "hpet_now_ns() ^ pid ^ counter"). Non-authoritative; a real
+#     CSPRNG primitive is the future replacement.
+#   * `sys_hpet_now_ns` (SC+ ID 45) -- monotonic ns counter, primary
+#     entropy source for the WEAK_ENTROPY_FALLBACK path. Also
+#     documented as WEAK_ENTROPY -- rdtsc-derived, not cryptographic.
+#
+# Both are ambient syscalls at v0.1.0 (no per-caller cap gate); the
+# capability contract on this file is therefore empty of MINTED
+# capabilities the consumer must grant. When a real CSPRNG capability
+# lands (KIND_CSPRNG, currently unfiled) this file grows a real
+# `requires:` line pointing at it and the TXID path swaps.
+requires: <none at v0.1.0 -- scaffold seed>
+
+# --- Declared output schemas (semantic-pipe records libpdx-net emits
+#     via sys_semantic_send). --------------------------------------------
+#
+# M3-005 (libpdx-net#15) binds TlsHandshakeRecord@0.1 (design/
+# networking/r100-user-tools-plan.md §10.3): a fixed-width record
+# emitted on every TLS handshake outcome including refusals (OK,
+# KEY_MISMATCH, HANDSHAKE_FAILED, TIMEOUT). The record's sig_algo
+# enum carries an MLDSA65_RESERVED tag alongside ED25519 so the
+# future ML-DSA-65 verify path is additive rather than a schema
+# break -- ED25519 is the only verify path M3-003 implements at
+# v0.1.0 (per §2.4 "prefer Ed25519 over ML-DSA-65 for v1"); the
+# reserved tag lets pdxtrust label a raw pubkey with an ML-DSA algo
+# marker today without libpdx-net's decode path having to grow the
+# enum later.
+declares_output_schemas:
+  - TlsHandshakeRecord@0.1     # M3-005 (#15)
+
+# Wire ownership -- TlsHandshakeRecord@0.1 is emitted by libpdx-net
+# on the ambient sys_semantic_send channel; there is no per-endpoint
+# broker registration (unlike svc.audit-journal for
+# PdxAuditRecord@0.2). Consumers who observe the semantic pipe will
+# see one TlsHandshakeRecord@0.1 per net_tls_wrap invocation
+# regardless of outcome -- INTENT-style records (one before the
+# handshake starts, one after) are NOT emitted at v0.1.0; only the
+# single terminal RESULT record is. If a future audit shape decides
+# it needs both, an INTENT variant is a new schema id
+# (TlsHandshakeIntent@0.1), not a mutation of @0.1.
+wire_ownership:
+  schema: TlsHandshakeRecord@0.1
+  transport: sys_semantic_send   # SC+ ID 115 (ambient, no cap gate)
+  producer_singleton: true       # libpdx-net is the only sanctioned producer
+
+# --- Consumed schemas (what libpdx-net reads / accepts as input). ---
+consumes_input_schemas: []
+
+# --- Future capability surface -- documented forward references so a
+#     grep for the KIND_ names finds this file. ------------------------
+#
+#   KIND_TLS_TRUST      (blocked on paideia-os#R100-PREP-001)  -- the
+#     pinned-key trust anchor net_tls_wrap consumes to select the
+#     server public key it verifies the transcript signature against.
+#     At v0.1.0 the trust cap is fronted by a stub (accepts any cap
+#     slot, KEY_MISMATCH always) -- pdxtrust M2 (issue #-- pending)
+#     mints the real ones.
+#
+#   KIND_CSPRNG         (unfiled)                              -- the
+#     future replacement for the WEAK_ENTROPY_FALLBACK path in
+#     net_dns_txid.pdx. Adds a `requires:` line here on landing.
