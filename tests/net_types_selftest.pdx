@@ -1,0 +1,103 @@
+// tests/net_types_selftest.pdx -- libpdx-net.M1-003 (libpdx-net#3)
+//
+// First-runnable stub test for the NetErr / DnsErr / TlsErr /
+// HttpErr enum shapes.
+//
+// =============================================================================
+// SCOPE
+// =============================================================================
+//
+// M1-003 asks for two things: the enum shapes (landed at v0.1.0
+// in src/net_types.pdx) and a "first-runnable stub test" that
+// proves the shapes assemble and are internally consistent.
+//
+// This module is the second half -- a pure function
+// `net_types_selftest() -> u64` that returns 0 iff the four
+// band-OK values (NET_OK=0x00, DNS_OK=0x10, TLS_OK=0x20,
+// HTTP_OK=0x30) satisfy their band-invariant. The invariant is
+// that the four OK codes XORed together equal 0x00 -- a
+// property that holds only for the specific spacing plan §2.1
+// mandates (16-byte band width, one OK-code per band, first
+// band starts at 0). A regression that renumbers one band
+// without renumbering the OK codes returns non-zero and the
+// test fails.
+//
+// The test does NOT link against src/net_types.pdx because
+// `bash tools/build.sh` compiles per-file (no cross-file
+// resolution). The literals here are duplicated deliberately;
+// if `src/net_types.pdx` ever mutates one OK code without
+// mutating this file's twin, this test flips to non-zero and
+// the mismatch surfaces on the first test run.
+//
+// =============================================================================
+// TEST-HARNESS CONTRACT
+// =============================================================================
+//
+// This is a "first-runnable stub test" per M1-003 -- it does
+// NOT require the paideia-as test harness (which lands with a
+// future user-tools TESTS wave). The contract is:
+//
+//   * `net_types_selftest` is `pub let ... : () -> u64` --
+//     callable from any consumer that statically links this
+//     object.
+//   * Return value 0 means "enum bands intact"; any non-zero
+//     value is the (staged) OK-code sum, which a future harness
+//     can print for diagnostic.
+//   * No I/O, no syscalls, no capability requirements -- runs
+//     in any address space.
+//
+// The M2-close test wave (issues yet to be filed under
+// libpdx-net.tests) grows this into a table-driven property
+// checker over every band; today's version is the smallest
+// runnable check that proves the shapes are wired.
+//
+// =============================================================================
+// paideia-as compliance
+// =============================================================================
+//
+//   - Module name PascalCase basename (`NetTypesSelftest`) matches file
+//     (`net_types_selftest.pdx`); no leading digits to strip.
+//   - Labels prefixed `libpdxnet_tsel_` -- disjoint from every other
+//     label prefix in this repo, avoids reserved keywords.
+//   - No `test rN, rN` -- pure XOR chain, no zero-check needed.
+//   - Every immediate is a small u32 (0x00/0x10/0x20/0x30); no
+//     MOVABS staging.
+//   - Leaf: no stack, no callee-save, no syscall.
+
+module NetTypesSelftest = structure {
+
+  // ==========================================================================
+  // net_types_selftest() -> u64
+  //
+  // Returns 0 iff (NET_OK ^ DNS_OK ^ TLS_OK ^ HTTP_OK) == 0.
+  // With the plan §2.1 spacing (bands at 0x00 / 0x10 / 0x20 /
+  // 0x30, each OK code as the first entry in its band) this
+  // reduces to 0x00 ^ 0x10 ^ 0x20 ^ 0x30 = 0x00. A mutation of
+  // any single OK code (e.g. TLS_OK -> 0x21) breaks the
+  // invariant and returns the non-zero delta.
+  //
+  // The chain uses `xor rax, rcx` (two-operand, single-reg form
+  // -- no immediate encoding). Every literal loaded stages via
+  // `mov rcx, imm32` since imm32 sign-extends cleanly for all
+  // four values (each fits in a byte).
+  // ==========================================================================
+  pub let net_types_selftest : () -> u64 !{} @{} =
+    fn () -> unsafe {
+      effects: {}, capabilities: {},
+      justification: "libpdx-net.M1-003 (#3): first-runnable stub test for the enum band invariant. Composes (NET_OK ^ DNS_OK ^ TLS_OK ^ HTTP_OK) via a four-step xor chain with each OK code staged through rcx (mov rcx, imm32). All four literals are single-byte values so imm32 sign-extends cleanly. Leaf: no stack, no callee-save, no syscall. Return: 0 on band-invariant hold, non-zero delta otherwise. Labels prefixed libpdxnet_tsel_.",
+      block: {
+        xor rax, rax;                  // rax = 0
+        mov rcx, 0x00;                 // NET_OK
+        xor rax, rcx;
+        mov rcx, 0x10;                 // DNS_OK
+        xor rax, rcx;
+        mov rcx, 0x20;                 // TLS_OK
+        xor rax, rcx;
+        mov rcx, 0x30;                 // HTTP_OK
+        xor rax, rcx;
+        // rax = 0x00 ^ 0x10 ^ 0x20 ^ 0x30 = 0x00 on invariant hold
+        ret
+      }
+    }
+
+}

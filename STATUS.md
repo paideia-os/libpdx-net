@@ -1,20 +1,26 @@
 # libpdx-net -- status
 
 **Wave:** R100 (client-side networking SDK)
-**Current milestone:** Wave N scaffold seed (v0.1.0) --
-  M3-005 (#15), M3-006 (#16), M4-001 (#17), M4-002 (#18),
-  M4-003 (#19) landed as per-file source scaffolds; sockets +
-  TLS handshake bodies pending upstream PREP items.
-**Version:** 0.1.0 (2026-09-13)
+**Current milestone:** Wave X drain (v0.2.0) -- M1-001 (#1)
+  scaffold witness, M1-002 (#2) public API stubs, M1-003 (#3)
+  enum-invariant first-runnable test, M5-001 (#21) + M5-002
+  (#22) release-tool swap-site placeholders. Wave N (v0.1.0)
+  M3-005/006 + M4-001/002/003 remain landed. Real socket
+  bodies + TLS handshake bodies remain pending upstream PREP
+  items.
+**Version:** 0.2.0 (2026-09-13)
 
 See `design/networking/r100-user-tools-plan.md` in paideia-os for the
 full R100 API surface + milestone catalog.
 
-## What ships at v0.1.0
+## What ships at v0.2.0
 
-- `src/tool_ident.pdx` -- `PDX_TOOL_NAME` + `PDX_TOOL_VERSION` externs.
+- `src/tool_ident.pdx` -- `PDX_TOOL_NAME` + `PDX_TOOL_VERSION` externs
+  (v0.2.0).
 - `src/net_types.pdx` -- four error bands (NetErr / DnsErr / TlsErr /
   HttpErr).
+- `src/net_api.pdx` -- **#2** M1-002 nine public API stubs
+  (net_socket/bind/connect/send/recv/close/inet_pton/resolve/tls_wrap).
 - `src/net_tls_record.pdx` -- **#15** M3-005 TlsHandshakeRecord@0.1
   schema + fail-closed emit stub.
 - `src/net_dns_txid.pdx` -- **#16** M3-006 WEAK_ENTROPY_FALLBACK TXID
@@ -25,6 +31,12 @@ full R100 API surface + milestone catalog.
   init + parse stub.
 - `src/net_http_chunked.pdx` -- **#19** M4-003 chunked-decoder stub +
   landed ASCII-hex-digit helper.
+- `tests/net_types_selftest.pdx` -- **#3** M1-003 first-runnable
+  stub test (enum band-invariant check).
+- `tools/release-sign.sh` -- **#21** M5-001 dual-signed release
+  swap-site placeholder (exit 2 pending upstream).
+- `tools/mirror-push.sh` -- **#22** M5-002 mirror push + verify
+  swap-site placeholder (exit 2 pending upstream).
 - `caps.decl`, `deps.list`, `manifest.pdxproj`, `.gitignore`,
   `tools/build.sh`, `CHANGELOG.md`.
 
@@ -35,7 +47,12 @@ full R100 API surface + milestone catalog.
 - **TLS handshake + record layer** for M3-001..M3-004 (issues
   #11-#14). Blocked on paideia-as crypto intrinsics (§12.4).
 - **Redirect handling** for M4-004 (issue #20). Separate landing.
-- **Signed release** at M5-001/002 (issues #21/#22).
+- **Real M5-001 dual-sign body** (issue #21) -- placeholder ships
+  at v0.2.0; body pending paideia-as `mldsa65_sign` + pdxsig
+  wire format + libpdx-docgen + KIND_RELEASE_SIGNING_KEY.
+- **Real M5-002 push+verify body** (issue #22) -- placeholder
+  ships at v0.2.0; body pending M5-001 + MIRRORS.list spec +
+  pdxsig-verify + mirror upload protocol.
 
 ## Build discipline
 
@@ -44,7 +61,7 @@ full R100 API surface + milestone catalog.
 at this step -- undefined externals across files are a link-time
 concern). Toolchain floor: paideia-as >= 0.21.0.
 
-**v0.1.0 landing NOT built by this seeding pass.** Main should invoke
+**v0.2.0 landing NOT built by this drain pass.** Main should invoke
 `bash tools/build.sh` and re-invoke softarch with the error tail if it
 fails (per project standing rule: builds are main-only, sub-agents
 never invoke build.sh).

@@ -49,10 +49,12 @@ module ToolIdent = structure {
   // VersionBackend::emit_default at run time via `lea rdi, [rip +
   // PDX_TOOL_VERSION]`.
   //
-  // v0.1.0 -- Wave N scaffold seed (libpdx-net#15/#16/#17/#18/#19).
-  // Keep this literal in lockstep with manifest.pdxproj `version`
+  // v0.2.0 -- Wave X drain (libpdx-net#1/#2/#3/#21/#22): scaffold
+  // witness + M1-002 public API stubs + M1-003 first-runnable
+  // stub test + M5-001/M5-002 release-tool placeholders. Keep
+  // this literal in lockstep with manifest.pdxproj `version`
   // and the top CHANGELOG.md entry.
   // ============================================================================
-  pub let PDX_TOOL_VERSION : [u8; 6] = "0.1.0\0"
+  pub let PDX_TOOL_VERSION : [u8; 6] = "0.2.0\0"
 
 }

@@ -1,0 +1,248 @@
+// src/net_api.pdx -- libpdx-net.M1-002 (libpdx-net#2)
+//
+// Public API surface stubs for the R100 client-side networking SDK.
+//
+// =============================================================================
+// SCOPE (design/networking/r100-user-tools-plan.md §2.1 + §13.1)
+// =============================================================================
+//
+// Publishes the nine public entry-point symbols the R100 API
+// contract advertises to any consumer that statically links
+// libpdx-net. Every entry-point is a fail-closed stub at v0.2.0:
+// each function returns a `*_ERR_NOT_IMPL` sentinel from its
+// corresponding NetTypes.pdx band (NET/DNS/TLS) so a caller can
+// discriminate "the SDK is a scaffold" from "the network refused
+// the operation" without inspecting a second slot.
+//
+// The nine symbols land here so tools that statically link
+// libpdx-net (pdxcurl, pdxdig, pdxsock, ...) get a stable ld
+// resolution TODAY, and every future real-body landing is an
+// in-place body swap at the same symbol -- callers do not
+// re-link when M2-001..M2-007 or M3-001..M3-004 flip from stub
+// to real.
+//
+// =============================================================================
+// API CONTRACT (per plan §2.1)
+// =============================================================================
+//
+//   net_socket(domain, kind, proto)             -> u64  fd | NET_ERR_*
+//   net_bind(sock, sa_va, sa_len)               -> u64  NET_OK | NET_ERR_*
+//   net_connect(sock, sa_va, sa_len)            -> u64  NET_OK | NET_ERR_*
+//   net_send(sock, buf_va, buf_len)             -> u64  n_sent | NET_ERR_*
+//   net_recv(sock, buf_va, buf_len)             -> u64  n_recv | NET_ERR_*
+//   net_close(sock)                             -> u64  NET_OK | NET_ERR_*
+//   net_inet_pton(str_va, str_len)              -> u64  ipv4_be | NET_ERR_INVAL
+//   net_resolve(name_va, name_len, out_va)      -> u64  DNS_OK  | DNS_ERR_*
+//   net_tls_wrap(sock, host_va, host_len, trust_cap)
+//                                               -> u64  TLS_OK  | TLS_ERR_*
+//
+// The four-argument cap on `net_tls_wrap` is deliberately the
+// current paideia-as SysV curried-fn ceiling; every other API
+// entry sits at three or fewer. A future five-argument variant
+// (e.g. to thread an explicit ALPN list) would land as a
+// separate symbol carrying packed args in a caller-owned struct
+// rather than extending this signature.
+//
+// =============================================================================
+// SWAP DISCIPLINE
+// =============================================================================
+//
+// Each stub carries the target milestone in its justification so
+// a grep for the milestone id (`M2-001`, `M3-001`, ...) finds
+// every affected stub in one pass on landing. The real body
+// replaces the `mov rax, <NOT_IMPL>; ret` triplet in-place; the
+// register plan and stack-alignment discipline documented here
+// carries forward unchanged.
+//
+// =============================================================================
+// paideia-as compliance
+// =============================================================================
+//
+//   - Module name PascalCase basename (`NetApi`) matches file.
+//   - Labels prefixed `libpdxnet_api_` -- disjoint from every other
+//     label prefix in this repo, avoids reserved keywords.
+//   - No `test rN, rN` -- cmp/je only (encoder pitfall).
+//   - Every immediate returned is a small u32 (0x0F/0x1F/0x2F);
+//     no MOVABS staging needed.
+//   - No `fn` with more than 4 curried args -- `net_tls_wrap` is
+//     at the ceiling; every other stub sits below.
+//   - No byte-register aliases (sil/dil/bl); no `neg`. Leaf stubs
+//     do not exercise either path.
+//   - String literals are absent from this file; every constant
+//     is a bare u64 immediate.
+
+module NetApi = structure {
+
+  // === Return-code aliases (from NetTypes.pdx bands) =======================
+  //
+  // Duplicated as bare u64 constants here so this file assembles
+  // cleanly in per-file `paideia-as build --emit elf64` mode
+  // without needing cross-module symbol resolution. Values MUST
+  // agree with net_types.pdx -- if either constant changes, the
+  // other one changes too (grep for the literal 0x0F / 0x1F / 0x2F).
+  pub let NETAPI_ERR_NOT_IMPL  : u64 = 0x0F   // == NetTypes.NET_ERR_NOT_IMPL
+  pub let NETAPI_DNS_NOT_IMPL  : u64 = 0x1F   // == NetTypes.DNS_ERR_NOT_IMPL
+  pub let NETAPI_TLS_NOT_IMPL  : u64 = 0x2F   // == NetTypes.TLS_ERR_NOT_IMPL
+
+  // ==========================================================================
+  // net_socket(domain, kind, proto) -> u64
+  //
+  // Future body: SC+ 87 (sys_socket). AF_INET/SOCK_STREAM at
+  // v1; other combinations refuse NET_ERR_INVAL. Returns a
+  // fd cap-index on success. Blocked by libpdx-net.M2-001 (#4).
+  // ==========================================================================
+  pub let net_socket : (u64, u64, u64) -> u64 !{} @{} =
+    fn (domain: u64, kind: u64, proto: u64) -> unsafe {
+      effects: {}, capabilities: {},
+      justification: "libpdx-net.M1-002 (#2) API stub for net_socket -- real body blocked on M2-001 (#4) SC+87 wrapper. Returns NET_ERR_NOT_IMPL (0x0F, small imm32); leaf, no stack, no callee-save. Labels prefixed libpdxnet_api_sock_.",
+      block: {
+        mov rax, 0x0F;                 // NET_ERR_NOT_IMPL
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // net_bind(sock, sa_va, sa_len) -> u64
+  //
+  // Future body: SC+ 88 (sys_bind). Blocked on M2-002 (#5).
+  // ==========================================================================
+  pub let net_bind : (u64, u64, u64) -> u64 !{} @{} =
+    fn (sock: u64, sa_va: u64, sa_len: u64) -> unsafe {
+      effects: {}, capabilities: {},
+      justification: "libpdx-net.M1-002 (#2) API stub for net_bind -- real body blocked on M2-002 (#5) SC+88 wrapper. Returns NET_ERR_NOT_IMPL (0x0F, small imm32); leaf. Labels prefixed libpdxnet_api_bind_.",
+      block: {
+        mov rax, 0x0F;                 // NET_ERR_NOT_IMPL
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // net_connect(sock, sa_va, sa_len) -> u64
+  //
+  // Future body: SC+ 91 (sys_connect). Blocked on M2-001 (#4).
+  // ==========================================================================
+  pub let net_connect : (u64, u64, u64) -> u64 !{} @{} =
+    fn (sock: u64, sa_va: u64, sa_len: u64) -> unsafe {
+      effects: {}, capabilities: {},
+      justification: "libpdx-net.M1-002 (#2) API stub for net_connect -- real body blocked on M2-001 (#4) SC+91 wrapper. Returns NET_ERR_NOT_IMPL (0x0F, small imm32); leaf. Labels prefixed libpdxnet_api_conn_.",
+      block: {
+        mov rax, 0x0F;                 // NET_ERR_NOT_IMPL
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // net_send(sock, buf_va, buf_len) -> u64
+  //
+  // Future body: SC+ 92 (sys_send). Real body returns bytes
+  // actually sent (may be < buf_len for a short write); caller
+  // loops on short writes. Blocked on M2-001 (#4).
+  // ==========================================================================
+  pub let net_send : (u64, u64, u64) -> u64 !{} @{} =
+    fn (sock: u64, buf_va: u64, buf_len: u64) -> unsafe {
+      effects: {}, capabilities: {},
+      justification: "libpdx-net.M1-002 (#2) API stub for net_send -- real body blocked on M2-001 (#4) SC+92 wrapper. Returns NET_ERR_NOT_IMPL (0x0F, small imm32); leaf. Labels prefixed libpdxnet_api_send_.",
+      block: {
+        mov rax, 0x0F;                 // NET_ERR_NOT_IMPL
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // net_recv(sock, buf_va, buf_len) -> u64
+  //
+  // Future body: SC+ 93 (sys_recv). Real body returns bytes
+  // actually received; 0 means peer closed cleanly (mapped to
+  // NET_ERR_CLOSED by the wrapper). Blocked on M2-001 (#4).
+  // ==========================================================================
+  pub let net_recv : (u64, u64, u64) -> u64 !{} @{} =
+    fn (sock: u64, buf_va: u64, buf_len: u64) -> unsafe {
+      effects: {}, capabilities: {},
+      justification: "libpdx-net.M1-002 (#2) API stub for net_recv -- real body blocked on M2-001 (#4) SC+93 wrapper. Returns NET_ERR_NOT_IMPL (0x0F, small imm32); leaf. Labels prefixed libpdxnet_api_recv_.",
+      block: {
+        mov rax, 0x0F;                 // NET_ERR_NOT_IMPL
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // net_close(sock) -> u64
+  //
+  // Future body: SC+ 3 (sys_close, generic fd close). Not
+  // milestoned separately; lands with M2-001 (#4).
+  // ==========================================================================
+  pub let net_close : (u64) -> u64 !{} @{} =
+    fn (sock: u64) -> unsafe {
+      effects: {}, capabilities: {},
+      justification: "libpdx-net.M1-002 (#2) API stub for net_close -- real body lands with M2-001 (#4) SC+3 (generic fd close). Returns NET_ERR_NOT_IMPL (0x0F, small imm32); leaf. Labels prefixed libpdxnet_api_close_.",
+      block: {
+        mov rax, 0x0F;                 // NET_ERR_NOT_IMPL
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // net_inet_pton(str_va, str_len) -> u64
+  //
+  // Future body: dotted-quad IPv4 parse (RFC 3986 §3.2.2 rule
+  // IPv4address). Returns the 32-bit IPv4 address in NETWORK
+  // byte order in the low 32 bits of rax; NET_ERR_INVAL (0x01)
+  // on any parse failure. No IPv6 at v1 per plan §2.2. Blocked
+  // on M2-004 (#7) -- pure function, no socket.
+  // ==========================================================================
+  pub let net_inet_pton : (u64, u64) -> u64 !{} @{} =
+    fn (str_va: u64, str_len: u64) -> unsafe {
+      effects: {}, capabilities: {},
+      justification: "libpdx-net.M1-002 (#2) API stub for net_inet_pton -- real body blocked on M2-004 (#7) dotted-quad parser (pure function, no socket). Returns NET_ERR_NOT_IMPL (0x0F, small imm32); leaf. Labels prefixed libpdxnet_api_pton_.",
+      block: {
+        mov rax, 0x0F;                 // NET_ERR_NOT_IMPL
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // net_resolve(name_va, name_len, out_va) -> u64
+  //
+  // Future body: build DNS query (M2-005 #8), send over UDP
+  // (M2-007 #10), parse response (M2-006 #9), verify TXID
+  // (M3-006 #16 -- already landed). Stores the first A record
+  // (4 bytes) at out_va on success. Returns DNS_OK / DNS_ERR_*.
+  // Blocked on M2-005/006/007 (#8/#9/#10) plus R100-PREP-002.
+  // ==========================================================================
+  pub let net_resolve : (u64, u64, u64) -> u64 !{} @{} =
+    fn (name_va: u64, name_len: u64, out_va: u64) -> unsafe {
+      effects: {}, capabilities: {},
+      justification: "libpdx-net.M1-002 (#2) API stub for net_resolve -- real body blocked on M2-005/006/007 (#8/#9/#10) plus R100-PREP-002 UDP-via-socket. Returns DNS_ERR_NOT_IMPL (0x1F, small imm32) from the DnsErr band so a caller who folds through the single-u64 return slot sees the failing layer immediately. Leaf. Labels prefixed libpdxnet_api_resolve_.",
+      block: {
+        mov rax, 0x1F;                 // DNS_ERR_NOT_IMPL
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // net_tls_wrap(sock, host_va, host_len, trust_cap) -> u64
+  //
+  // Future body: TLS 1.3 handshake over an already-connected
+  // socket (ClientHello + ServerHello + key schedule +
+  // Ed25519 verify + record-layer seal/open). Emits one
+  // TlsHandshakeRecord@0.1 per outcome (M3-005 #15 -- already
+  // landed) regardless of verdict. Blocked on M3-001..M3-004
+  // (#11/#12/#13/#14) which are themselves blocked on
+  // R100-PREP-005 (paideia-as crypto intrinsics).
+  //
+  // Four-argument entry sits at the paideia-as SysV curried-fn
+  // ceiling by design; adding an ALPN list or SNI-override
+  // param at v2 will land as a separate symbol carrying packed
+  // args in a caller-owned struct.
+  // ==========================================================================
+  pub let net_tls_wrap : (u64, u64, u64, u64) -> u64 !{} @{} =
+    fn (sock: u64, host_va: u64, host_len: u64, trust_cap: u64) -> unsafe {
+      effects: {}, capabilities: {},
+      justification: "libpdx-net.M1-002 (#2) API stub for net_tls_wrap -- real body blocked on M3-001..M3-004 (#11/#12/#13/#14) plus R100-PREP-005 (paideia-as crypto intrinsics). Returns TLS_ERR_NOT_IMPL (0x2F, small imm32) from the TlsErr band so a caller who folds through the single-u64 return slot sees the failing layer immediately. Four args at the paideia-as SysV curried-fn ceiling by design; a v2 five-arg variant lands as a separate symbol with packed args. Leaf. Labels prefixed libpdxnet_api_tls_.",
+      block: {
+        mov rax, 0x2F;                 // TLS_ERR_NOT_IMPL
+        ret
+      }
+    }
+
+}

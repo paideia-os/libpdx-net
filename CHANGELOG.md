@@ -3,6 +3,99 @@
 All notable changes to this repository are documented here. Versioning
 follows SemVer with a v0.x series until the M5 signed release.
 
+## [0.2.0] -- 2026-09-13 (Wave X drain)
+
+**Scope:** drain five remaining M1 / M5 open issues after Wave N.
+No new socket / TLS bodies land (those remain blocked on the R100
+PREP items); this bump publishes the public API surface as stubs
+so downstream tools can ld-resolve today, adds the first-runnable
+enum-invariant test, closes the scaffold witness, and lands
+release-tool placeholders at the swap sites the v1.0 signed
+release will consume.
+
+### Landed
+
+- `#1` -- **M1-001 scaffold + module boundary (WITNESS).** Every
+  scaffold artifact called out in the original issue landed at
+  v0.1.0: `manifest.pdxproj` (kind=shared-library, source list,
+  deps), `caps.decl` (declared schemas + forward capability refs),
+  `deps.list` (upstream PENDING items with swap sites),
+  `tools/build.sh` (paideia-as >= 0.21.0 resolver + per-file
+  emit loop), `.gitignore`, `LICENSE` (MIT, org-standard),
+  `README.md`, `src/tool_ident.pdx` (PDX_TOOL_NAME +
+  PDX_TOOL_VERSION externs), `src/net_types.pdx` (four error
+  bands). Module boundary is the `paideia-as build --emit elf64`
+  per-file object emit floor -- no cross-file link resolution at
+  build.sh time; consumers do the final link. No further work
+  under M1-001 at v0.2.0.
+
+- `#2` -- **M1-002 public API stubs.** `src/net_api.pdx` publishes
+  the nine R100 API entry-points as fail-closed stubs so
+  downstream tools (pdxcurl, pdxdig, pdxsock, ...) get a stable
+  `ld` resolution today: `net_socket`, `net_bind`, `net_connect`,
+  `net_send`, `net_recv`, `net_close`, `net_inet_pton`,
+  `net_resolve`, `net_tls_wrap`. Each stub returns a
+  band-appropriate `*_ERR_NOT_IMPL` sentinel (NET / DNS / TLS)
+  so a caller who folds through the single-u64 return slot sees
+  the failing layer without a second slot. `net_tls_wrap` sits at
+  the four-argument paideia-as SysV curried-fn ceiling by design;
+  a future five-argument variant lands as a separate symbol with
+  packed args in a caller-owned struct rather than extending this
+  signature. Every stub's justification carries the target
+  milestone id (`M2-001` / `M3-001` / ...) so a grep on landing
+  finds every affected call site in one pass.
+
+- `#3` -- **M1-003 enum shapes + first-runnable stub test.** Enum
+  shapes landed at v0.1.0 in `src/net_types.pdx` (four bands,
+  0x00..0x3F). Test half lands as `tests/net_types_selftest.pdx`:
+  `net_types_selftest() -> u64` returns 0 iff
+  `NET_OK ^ DNS_OK ^ TLS_OK ^ HTTP_OK` == 0, which holds only
+  for the plan §2.1 spacing (16-byte bands, one OK-code per
+  band, first band starts at 0). A regression that renumbers
+  one OK code without renumbering the whole band flips the sum
+  to non-zero and the test fails; the future table-driven
+  property-check wave grows from this one runnable check.
+  `manifest.pdxproj` `tests:` list wired.
+
+- `#21` -- **M5-001 dual-signed manifest.pdxsig + CHANGELOG-1.0 +
+  .pdxdoc (SWAP-SITE PLACEHOLDER).** `tools/release-sign.sh`
+  lands as the swap site for the v1.0 dual-signed release
+  emitter. Body is deliberately `exit 2` at v0.2.0 -- the
+  paideia-as `mldsa65_sign` intrinsic, the pdxsig canonical wire
+  format, the libpdx-docgen .pdxdoc bundler, and the
+  KIND_RELEASE_SIGNING_KEY capability are all still upstream on
+  paideia-os. Script header documents every blocker by name plus
+  the frozen `<release-tag> [--dry-run]` invocation contract and
+  the four env inputs (`PDX_ED25519_SIGNING_KEY`,
+  `PDX_MLDSA65_SIGNING_KEY`, `PDX_DOCGEN`, `PDX_PDXSIG`) so the
+  swap on landing is a body replacement rather than a re-design.
+
+- `#22` -- **M5-002 mirror push (SWAP-SITE PLACEHOLDER).**
+  `tools/mirror-push.sh` lands as the swap site for the
+  multi-mirror release push + verify loop. Body is `exit 2` at
+  v0.2.0 -- blocked on M5-001 (no artifacts to push yet), on
+  the MIRRORS.list format spec (not yet designed on paideia-os),
+  on the pdxsig-verify binary (paideia-os issue TBD), and on
+  the mirror upload protocol choice. Frozen invocation contract:
+  `tools/mirror-push.sh <release-tag> [--mirrors MIRRORS.list]
+  [--dry-run]` with `PDX_MIRROR_CREDENTIALS_DIR` and
+  `PDX_PDXSIG_VERIFY` env inputs and a four-code exit-status
+  table (0 all-verified / 1 upload-failed / 2 pre-conditions
+  unmet).
+
+### Not landed
+
+- **Real socket bodies** (M2-001..M2-007, issues #4-#10) --
+  separate landing.
+- **TLS handshake + record layer** (M3-001..M3-004, issues
+  #11-#14) -- blocked on paideia-as crypto intrinsics per plan
+  §12.4.
+- **Redirect handling** (M4-004, issue #20) -- separate landing.
+- **Real M5-001 dual-sign body** -- blocked on four paideia-os
+  items enumerated above.
+- **Real M5-002 push+verify body** -- blocked on M5-001 + three
+  paideia-os items enumerated above.
+
 ## [0.1.0] -- 2026-09-13 (Wave N scaffold seed)
 
 **Scope:** first source drop for the R100 client-side networking SDK

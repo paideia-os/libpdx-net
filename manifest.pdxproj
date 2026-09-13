@@ -20,7 +20,7 @@
 # -- the mkfs.pdxfs pattern (parses, does not transmit, ships anyway).
 
 name        = libpdx-net
-version     = 0.1.0
+version     = 0.2.0
 kind        = shared-library
 output      = build-out/libpdx-net.a
 caps_decl   = caps.decl
@@ -31,6 +31,7 @@ caps_decl   = caps.decl
 sources:
   - src/tool_ident.pdx          # PDX_TOOL_NAME / PDX_TOOL_VERSION externs
   - src/net_types.pdx           # NetErr/DnsErr/TlsErr/HttpErr enum tags
+  - src/net_api.pdx             # M1-002 public API stubs (#2)
   - src/net_tls_record.pdx      # M3-005: TlsHandshakeRecord@0.1 schema + emit (#15)
   - src/net_dns_txid.pdx        # M3-006: resolver TXID randomize + verify (#16)
   - src/net_http_request.pdx    # M4-001 GET encode + M4-002 POST encode (#17/#18)
@@ -38,7 +39,7 @@ sources:
   - src/net_http_chunked.pdx    # M4-003 chunked transfer-encoding decode (#19)
 
 # --- Library dependencies ---------------------------------------------
-# libpdx-net at v0.1.0 depends on nothing outside the SC+ syscall
+# libpdx-net at v0.2.0 depends on nothing outside the SC+ syscall
 # floor. libpdx-audit is a soft dep (semantic-pipe emission target
 # for TlsHandshakeRecord@0.1) -- the call is fronted by a local
 # stub (net_tls_record_emit_stub) that keeps a stable ABI at the
@@ -47,11 +48,12 @@ sources:
 deps: []
 
 # --- Test targets ------------------------------------------------------
-# Unit tests over the pure encoder/decoder halves land at M4-close
-# (issues #17/#18/#19 test-vector sub-issues yet to be filed). No
-# QEMU-substrate smokes at v0.1.0 -- pdxcurl / pdxdig / pdxsock
-# smokes at their own R100.M4 milestones cover the integration.
-tests: []
+# M1-003 (#3) first-runnable stub test lives at
+# tests/net_types_selftest.pdx; per-file object built alongside
+# src/*.pdx by tools/build.sh. Table-driven property checks over
+# every band are a future TESTS-wave add (issues TBD).
+tests:
+  - tests/net_types_selftest.pdx  # M1-003 (#3) enum band-invariant self-test
 
 # --- Documentation targets --------------------------------------------
 # .pdxdoc source lands at M5-001 alongside the first signed release.
