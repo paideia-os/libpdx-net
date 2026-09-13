@@ -1,0 +1,188 @@
+// src/net_inet.pdx -- libpdx-net.M2-004 (libpdx-net#7)
+//
+// net_inet_pton: dotted-quad IPv4 string parse.
+//
+// =============================================================================
+// SCOPE (design/networking/r100-user-tools-plan.md §2.2 -- "no IPv6 at
+// v1")
+// =============================================================================
+//
+// `net_inet_pton(str_ptr, str_len, out_be_ptr) -> u64` parses an
+// ASCII dotted-quad IPv4 literal ("a.b.c.d", each octet a 1-3-digit
+// decimal 0..255) and stores the address as 4 packed bytes in
+// NETWORK byte order (a, b, c, d in that memory order -- the same
+// order the wire uses) at `out_be_ptr`. Returns 0 on success, 1 on
+// any parse failure. This is the same 0/1 contract net_api.pdx's own
+// `net_inet_pton` stub already documents ("NET_ERR_INVAL (0x01) on
+// any parse failure"); this file is the real body net_api.pdx's
+// stub is blocked on (M2-004, #7).
+//
+// SCOPE CUTS at v0.1.0 (all per plan §2.2's own "no IPv6 at v1"
+// posture):
+//
+//   * Exactly four dot-separated octets -- no IPv6, no
+//     abbreviated/octal/hex forms (no "0x", no leading-zero octal
+//     reinterpretation -- a leading zero is just an ordinary decimal
+//     digit here, e.g. "192.168.001.1" parses as 1, not octal 1).
+//   * No leading/trailing whitespace tolerance -- the caller-supplied
+//     `str_len` window must contain nothing but the dotted-quad
+//     itself.
+//   * Any non-digit, non-'.' byte anywhere in the window is a hard
+//     parse failure (this includes a trailing NUL if the caller
+//     passed a C-string length that includes it -- callers must pass
+//     the exact digit-and-dot span).
+//
+// -----------------------------------------------------------------------------
+// Algorithm
+// -----------------------------------------------------------------------------
+//
+// Single left-to-right byte scan. An accumulator (`acc`) and a
+// per-octet digit counter (`ndig`) build up the current octet's
+// value; a running `octet_idx` (0..3) counts how many octets have
+// been written to `out_be_ptr` so far.
+//
+//   - digit '0'..'9': ndig >= 3 -> fail (max 3 digits/octet);
+//     acc = acc*10 + digit; acc > 255 -> fail.
+//   - '.': ndig == 0 -> fail (empty octet, e.g. "..", leading ".",
+//     or two dots in a row); octet_idx == 3 already -> fail (more
+//     than 4 octets); write `acc` as the byte at
+//     out_be_ptr[octet_idx], octet_idx += 1, reset acc/ndig.
+//   - any other byte: fail immediately.
+//   - end of string: octet_idx must be exactly 3 (three dots seen)
+//     and ndig >= 1 (a trailing 4th octet was accumulated); write
+//     `acc` as out_be_ptr[3].
+//
+// A 3-operand `imul reg, reg, 10` computes `acc*10` -- the paideia-as
+// 2-operand `imul` form is the banned encoder shape, not the
+// 3-operand `imul r, r, imm` form used here (same operand for dst
+// and src is a plain re-read-and-multiply, not a special case).
+//
+// =============================================================================
+// paideia-as compliance
+// =============================================================================
+//
+//   - Module name PascalCase basename (`NetInet`) matches file.
+//   - Labels prefixed `netin_pton_` -- disjoint from every other
+//     label prefix in this repo, avoids the reserved `loop` keyword
+//     by never using a bare `loop:` label.
+//   - No `test rN, rN` -- cmp/je/jl/jg/jge only.
+//   - Byte loads go through the xor-then-mov_b idiom (`xor r10,r10;
+//     mov_b r10,[rdi+rax]`) per the paideia-as #1248 zero-extend
+//     workaround already proven in ethernet.pdx / mount_op.pdx.
+//   - Byte store uses register-indexed `mov_b [rdx + r9], rcx`,
+//     the same base+index form eth_parse's validation loop proves
+//     (`mov_b r10,[rbx+rcx]`).
+//   - Only the 3-operand `imul r,r,imm` form is used (`imul rcx,
+//     rcx, 10`); no 2-operand `imul`.
+//   - Every immediate (0x2E, 0x30, 0x39, 3, 255, 10) is a small
+//     imm32 -- no MOVABS staging.
+//   - No `and rN, imm64` on r8-r15 anywhere in this file.
+//   - Leaf function: no nested `call`, so no callee-save prologue
+//     and no stack-alignment padding is needed at all -- every GPR
+//     used (rax, rcx, r8, r9, r10) is caller-save scratch.
+
+module NetInet = structure {
+
+  // === Return-code aliases (from NetTypes.NetErr band) ======================
+  //
+  // Duplicated as bare u64 constants per this repo's per-file
+  // `paideia-as build --emit elf64` convention (see net_dns_txid.pdx /
+  // net_api.pdx for the same pattern) -- values MUST agree with
+  // net_types.pdx.
+  pub let NETIN_OK         : u64 = 0x00   // == NetTypes.NET_OK
+  pub let NETIN_ERR_INVAL  : u64 = 0x01   // == NetTypes.NET_ERR_INVAL
+
+  // ============================================================================
+  // net_inet_pton_raw(str_ptr, str_len, out_be_ptr) -> u64
+  // ============================================================================
+  //
+  // Named `_raw` (rather than bare `net_inet_pton`) because
+  // net_api.pdx already publishes a public `net_inet_pton` symbol at
+  // ITS OWN, older, two-argument, packed-return contract
+  // (`(str_va, str_len) -> u64`, per that file's original M1-002
+  // stub). paideia-as has no per-module symbol namespacing (every
+  // `pub let` is a flat, repo-linked global), so this engine cannot
+  // reuse that exact name without a duplicate-definition link
+  // failure. net_api.pdx's `net_inet_pton` is, this same landing,
+  // swapped into a thin adapter that calls this `_raw` engine and
+  // folds its out-pointer result back into that stable two-argument
+  // public contract -- see net_api.pdx's own updated justification
+  // for `net_inet_pton`.
+  //
+  // rdi = str_ptr, rsi = str_len, rdx = out_be_ptr (caller-owned,
+  // >= 4 bytes).
+  //
+  // Returns NETIN_OK (0) on success with 4 bytes written at
+  // out_be_ptr in network byte order; NETIN_ERR_INVAL (1) on any
+  // parse failure (out_be_ptr is left untouched on failure -- the
+  // caller must not read it unless the return is 0).
+  // ============================================================================
+  pub let net_inet_pton_raw : (u64, u64, u64) -> u64 !{mem} @{} =
+    fn (str_ptr: u64, str_len: u64, out_be_ptr: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "libpdx-net.M2-004 (#7): dotted-quad IPv4 parse, the real engine net_api.pdx's net_inet_pton adapter delegates to (named _raw to dodge the flat-global-symbol collision with net_api.pdx's own, differently-shaped, public net_inet_pton -- see this function's own doc comment above). Register plan: rdi=str_ptr, rsi=str_len, rdx=out_be_ptr held fixed throughout (never overwritten); rax=i (byte index), rcx=acc (current octet accumulator, also the imul dst/src for *10), r8=ndig (digit count in current octet), r9=octet_idx (0..3, octets already written), r10=current byte (xor-then-mov_b per #1248). Leaf -- no nested call, so no push/pop and no alignment padding needed; every register above is ordinary caller-save scratch. Digit path: cmp r10 against 0x30/0x39 range; ndig>=3 -> fail (netin_pton_fail); `imul rcx,rcx,10` (3-operand form, not the banned 2-operand shape) then add the digit; acc>255 -> fail. Dot path (byte==0x2E): ndig==0 -> fail (empty octet); octet_idx==3 already -> fail (5th+ octet); `mov_b [rdx+r9], rcx` writes the completed octet at out_be_ptr[octet_idx] (register+register addressing, same form eth_parse's validation loop proves); octet_idx+=1; reset acc/ndig; advance i. End-of-string path (i>=str_len): octet_idx must == 3 and ndig>=1, else fail; write the trailing 4th octet at out_be_ptr[3]. Any other byte value falls through the digit-range checks straight to netin_pton_fail. No `test rN,rN` (cmp/jl/jg/jge/je only); no `and rN,imm64` on r8-r15. Labels prefixed netin_pton_.",
+      block: {
+        xor rax, rax;                     // i = 0
+        xor rcx, rcx;                     // acc = 0
+        xor r8, r8;                       // ndig = 0
+        xor r9, r9;                       // octet_idx = 0
+
+      netin_pton_loop:
+        cmp rax, rsi;
+        jge netin_pton_end;
+
+        xor r10, r10;
+        mov_b r10, [rdi + rax];           // r10 = str_ptr[i]
+
+        cmp r10, 0x2E;                    // '.'
+        je  netin_pton_dot;
+
+        cmp r10, 0x30;                    // '0'
+        jl  netin_pton_fail;
+        cmp r10, 0x39;                    // '9'
+        jg  netin_pton_fail;
+
+        cmp r8, 3;
+        jge netin_pton_fail;              // > 3 digits in this octet
+
+        sub r10, 0x30;                    // r10 = digit value
+        imul rcx, rcx, 10;                // acc *= 10 (3-operand form)
+        add rcx, r10;                     // acc += digit
+        cmp rcx, 255;
+        jg  netin_pton_fail;              // octet out of range
+
+        add r8, 1;                        // ndig += 1
+        add rax, 1;                       // i += 1
+        jmp netin_pton_loop;
+
+      netin_pton_dot:
+        cmp r8, 0;
+        je  netin_pton_fail;              // empty octet before this dot
+        cmp r9, 3;
+        jge netin_pton_fail;              // already saw 3 dots
+
+        mov_b [rdx + r9], rcx;            // out_be_ptr[octet_idx] = acc
+        add r9, 1;                        // octet_idx += 1
+        xor rcx, rcx;                     // acc = 0
+        xor r8, r8;                       // ndig = 0
+        add rax, 1;                       // i += 1
+        jmp netin_pton_loop;
+
+      netin_pton_end:
+        cmp r9, 3;
+        jne netin_pton_fail;              // did not see exactly 3 dots
+        cmp r8, 0;
+        je  netin_pton_fail;              // no trailing 4th octet
+
+        mov_b [rdx + 3], rcx;             // out_be_ptr[3] = acc
+
+        mov rax, 0;                       // NETIN_OK
+        ret;
+
+      netin_pton_fail:
+        mov rax, 1;                       // NETIN_ERR_INVAL
+        ret
+      }
+    }
+
+}

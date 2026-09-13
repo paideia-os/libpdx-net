@@ -1,0 +1,281 @@
+// src/net_dns_query.pdx -- libpdx-net.M2-005 (libpdx-net#8)
+//
+// DNS query builder: RFC 1035 header + one-question encode.
+//
+// =============================================================================
+// SCOPE (design/networking/r100-user-tools-plan.md §2.3 + RFC 1035 §4.1)
+// =============================================================================
+//
+// Builds a complete DNS request datagram: the fixed 12-byte header
+// (RFC 1035 §4.1.1) followed by exactly one question (RFC 1035
+// §4.1.2 -- QNAME in RFC 1035 label form, then QTYPE, then QCLASS,
+// each a big-endian u16). No compression on the way out (nothing to
+// compress against in a fresh single-question query); no additional
+// or authority records.
+//
+// Header field values this builder always emits:
+//   ID       -- fresh WEAK_ENTROPY_FALLBACK TXID from
+//               net_dns_txid.pdx's net_dns_txid_next() (M3-006, #16,
+//               already landed) rather than a raw rdtsc read here --
+//               reusing that already-labeled entropy source keeps
+//               every TXID in this library flowing through the one
+//               file a future CSPRNG swap needs to touch (see that
+//               file's own SWAP SITE note).
+//   QR=0, OPCODE=0, AA=0, TC=0, RD=1   -- flags byte 1 = 0x01
+//   RA=0, Z=0, RCODE=0                 -- flags byte 2 = 0x00
+//   QDCOUNT=1, ANCOUNT=0, NSCOUNT=0, ARCOUNT=0
+//
+// -----------------------------------------------------------------------------
+// Signature deviates from the issue's literal 7-argument listing --
+// paideia-as 4-argument curried-fn ceiling
+// -----------------------------------------------------------------------------
+//
+// libpdx-net#8 lists the conceptual contract as
+// `net_dns_build_query(name_ptr, name_len, qtype, qclass, out_ptr,
+// out_max, out_len_ptr) -> u64` -- seven logical inputs. paideia-as
+// curried `fn` definitions cap at four arguments (net_api.pdx's own
+// `net_tls_wrap` already documents sitting at this exact ceiling and
+// prescribes the fix: "a future five-argument variant... lands as a
+// separate symbol carrying packed args in a caller-owned struct
+// rather than extending this signature"). This file applies that
+// same fix: the real signature is
+//
+//     net_dns_build_query(name_ptr, name_len, params_ptr, out_len_ptr) -> u64
+//
+// where `params_ptr` points to a caller-owned, 32-byte packed struct:
+//
+//     +0   qtype    u64 (low 16 bits meaningful)
+//     +8   qclass   u64 (low 16 bits meaningful)
+//     +16  out_ptr  u64 (destination buffer)
+//     +24  out_max  u64 (destination buffer capacity in bytes)
+//
+// A caller (e.g. a future net_resolve real body) builds this struct
+// on its own stack or a static scratch area; the four real
+// parameters this function takes are name_ptr, name_len, params_ptr,
+// out_len_ptr, exactly at the paideia-as ceiling.
+//
+// -----------------------------------------------------------------------------
+// RFC 1035 label-form name encode
+// -----------------------------------------------------------------------------
+//
+// "www.example.com" encodes as: 0x03 'w' 'w' 'w' 0x07 'e' 'x' 'a' 'm'
+// 'p' 'l' 'e' 0x03 'c' 'o' 'm' 0x00. Each label's length byte must be
+// 1..63 (RFC 1035 §3.1); a label of length 0 (empty -- leading dot,
+// trailing dot, or "..") is refused. The scan walks `name_ptr` once,
+// treating both an ASCII '.' and end-of-string as a label boundary
+// that triggers a length-byte + copy flush; end-of-string additionally
+// triggers the root (0x00) terminator.
+//
+// Returns DNSQ_OK (0x10, == NetTypes.DNS_OK) on success with the
+// total encoded byte count written to `*out_len_ptr`. On any failure
+// (empty name, empty/oversize label, output buffer too small)
+// returns DNSQ_ERR_ENCODE (0x13, == NetTypes.DNS_ERR_MALFORMED,
+// reused here the same way net_dns_txid_write_header_id reuses
+// TXID_ERR_MISMATCH for a null-buf refusal -- the DnsErr band has no
+// dedicated ENCODE-side code, and "this query cannot be trusted to
+// reach the wire correctly" is the same failure family as
+// MALFORMED) and writes 0 to `*out_len_ptr` (fail-closed -- the
+// caller must not read a stale/partial length on error).
+//
+// =============================================================================
+// paideia-as compliance
+// =============================================================================
+//
+//   - Module name PascalCase basename (`NetDnsQuery`) matches file.
+//   - Labels prefixed `netdq_` -- disjoint from every other label
+//     prefix in this repo.
+//   - No `test rN, rN` -- cmp/je/jne/jge/jg only.
+//   - No 2-operand `imul`; none used in this file.
+//   - Byte loads/stores go through `mov_b` with the xor-then-load
+//     idiom on the load side (#1248 workaround); immediate-source
+//     `mov_b [mem], imm` is used for the fixed header bytes, the
+//     same form passphrase_wire.pdx's `mov_b [rdi+rcx], 0` proves.
+//   - Base+index memory addressing (`[r14 + r15]`) is the same form
+//     eth_parse / net_inet_pton already prove.
+//   - Exactly four curried args (name_ptr, name_len, params_ptr,
+//     out_len_ptr) -- at, not over, the paideia-as ceiling.
+//   - One nested `call net_dns_txid_next` -- 4-push callee-save
+//     prologue (rbx/rbp/r12/r13 hold the four incoming args across
+//     the call) + one 8-byte pad: entry rsp%16==8, four pushes land
+//     rsp%16==8, `sub rsp,8` -> rsp%16==0 for the call, `add rsp,8`
+//     undoes the pad afterward. Matches net_dns_txid_next's own
+//     documented alignment discipline.
+//   - Capability propagation: `net_dns_txid_next` carries
+//     `capabilities: {boot}` (propagated there from hpet_now_ns);
+//     this function calls it directly, so it declares
+//     `capabilities: {boot}` too, per the same propagation rule that
+//     function's own justification documents.
+
+module NetDnsQuery = structure {
+
+  // === Status aliases (from NetTypes.DnsErr band) ============================
+  pub let DNSQ_OK          : u64 = 0x10   // == NetTypes.DNS_OK
+  pub let DNSQ_ERR_ENCODE  : u64 = 0x13   // == NetTypes.DNS_ERR_MALFORMED (reused)
+
+  // ============================================================================
+  // net_dns_build_query(name_ptr, name_len, params_ptr, out_len_ptr) -> u64
+  // ============================================================================
+  //
+  // See file header for the params_ptr packed-struct layout
+  // (qtype@0, qclass@8, out_ptr@16, out_max@24) and the four-argument
+  // ceiling rationale.
+  // ============================================================================
+  pub let net_dns_build_query : (u64, u64, u64, u64) -> u64 !{mem} @{boot} =
+    fn (name_ptr: u64, name_len: u64, params_ptr: u64, out_len_ptr: u64) -> unsafe {
+      effects: {mem}, capabilities: {boot},
+      justification: "libpdx-net.M2-005 (#8): DNS query builder. 4-push callee-save prologue (rbx=name_ptr, rbp=name_len, r12=params_ptr, r13=out_len_ptr) + `sub rsp,8` pad: entry rsp%16==8, four pushes land rsp%16==8, pad -> 0 for `call net_dns_txid_next`; `add rsp,8` undoes the pad. After the call, rax=txn_id (low 16 bits) and every caller-save register (rcx/rdx/rsi/rdi/r8/r9/r10/r11) is free scratch for the remainder of the function -- no further nested call happens. r14=out_ptr and r9=out_max are loaded once from [r12+16]/[r12+24] (params_ptr survives untouched in r12, so qtype/qclass are reloaded fresh from [r12+0]/[r12+8] at the point they're actually written, rather than kept live across the whole name-encode loop). r15=cursor tracks the running write offset into out_ptr, starting at 12 after the fixed header. Header write: txn_id's two bytes split high-then-low (network order, same idiom as net_dns_txid_write_header_id); the remaining 10 header bytes are `mov_b [r14+N], imm` immediate stores (0x01 flags1, 0x00 flags2, 0x00/0x01 QDCOUNT, 0x00/0x00 ANCOUNT/NSCOUNT/ARCOUNT). Name-encode loop (rax=i, rdx=label_start, rcx=label_len, r8/r10/r11=transient scratch): scans name_ptr for '.' or end-of-string, computes label_len=i-label_start, refuses empty (==0) or oversize (>63) labels, bound-checks length-byte+data against out_max, writes the length byte then copies the label bytes via a base-register-plus-index copy loop (r11=name_ptr+label_start computed once per label so the inner copy uses plain [r11+r8]/[r14+r15] addressing, avoiding any three-register address). On end-of-string after the final label flush, writes the root 0x00 terminator (bound-checked). Then reloads qtype/qclass fresh from params_ptr and writes both as big-endian u16 pairs (bound-checked for the 4 trailing bytes). Success: `mov [r13+0], r15` publishes the total length, returns DNSQ_OK (0x10). Failure (any bound-check or empty/oversize-label refusal): zeroes `*out_len_ptr` first (fail-closed) then returns DNSQ_ERR_ENCODE (0x13, reused from NetTypes.DNS_ERR_MALFORMED per this repo's established reuse-a-closest-fit-code precedent). No `test rN,rN`; no 2-operand `imul` (none needed here). Labels prefixed netdq_.",
+      block: {
+        push rbx;
+        push rbp;
+        push r12;
+        push r13;
+
+        mov rbx, rdi;                     // name_ptr
+        mov rbp, rsi;                     // name_len
+        mov r12, rdx;                     // params_ptr
+        mov r13, rcx;                     // out_len_ptr
+
+        sub rsp, 8;
+        call net_dns_txid_next;           // rax = txn_id (low 16 bits)
+        add rsp, 8;
+
+        mov r14, [r12 + 16];              // r14 = out_ptr
+        mov r9,  [r12 + 24];              // r9  = out_max
+
+        cmp r9, 12;
+        jl  netdq_fail;                   // no room even for the header
+
+        // --- header: ID (network byte order) ---
+        mov rcx, rax;                     // rcx = txn_id
+        mov rdx, rcx;
+        shr rdx, 8;
+        and rdx, 0xff;
+        mov_b [r14 + 0], rdx;             // ID high byte
+        and rcx, 0xff;
+        mov_b [r14 + 1], rcx;             // ID low byte
+
+        // --- header: flags + counts (fixed) ---
+        mov_b [r14 + 2], 0x01;            // QR=0 OPCODE=0 AA=0 TC=0 RD=1
+        mov_b [r14 + 3], 0x00;            // RA=0 Z=0 RCODE=0
+        mov_b [r14 + 4], 0x00;            // QDCOUNT hi
+        mov_b [r14 + 5], 0x01;            // QDCOUNT lo = 1
+        mov_b [r14 + 6], 0x00;            // ANCOUNT hi
+        mov_b [r14 + 7], 0x00;            // ANCOUNT lo
+        mov_b [r14 + 8], 0x00;            // NSCOUNT hi
+        mov_b [r14 + 9], 0x00;            // NSCOUNT lo
+        mov_b [r14 + 10], 0x00;           // ARCOUNT hi
+        mov_b [r14 + 11], 0x00;           // ARCOUNT lo
+
+        mov r15, 12;                      // cursor = 12
+
+        // --- name label encode ---
+        xor rax, rax;                     // i = 0
+        xor rdx, rdx;                     // label_start = 0
+
+      netdq_name_loop:
+        cmp rax, rbp;
+        jge netdq_name_flush;             // i >= name_len -> flush final label
+
+        xor r10, r10;
+        mov_b r10, [rbx + rax];           // r10 = name_ptr[i]
+        cmp r10, 0x2E;                    // '.'
+        je  netdq_name_flush;
+
+        add rax, 1;
+        jmp netdq_name_loop;
+
+      netdq_name_flush:
+        mov rcx, rax;
+        sub rcx, rdx;                     // label_len = i - label_start
+        cmp rcx, 0;
+        je  netdq_fail;                   // empty label
+        cmp rcx, 63;
+        jg  netdq_fail;                   // label too long
+
+        mov r8, r15;
+        add r8, 1;
+        add r8, rcx;
+        cmp r8, r9;
+        jg  netdq_fail;                   // length byte + data won't fit
+
+        mov_b [r14 + r15], rcx;           // length byte
+        add r15, 1;
+
+        mov r11, rbx;
+        add r11, rdx;                     // r11 = name_ptr + label_start
+
+        xor r8, r8;                       // j = 0
+      netdq_name_copy:
+        cmp r8, rcx;
+        jge netdq_name_copy_done;
+        xor r10, r10;
+        mov_b r10, [r11 + r8];
+        mov_b [r14 + r15], r10;
+        add r15, 1;
+        add r8, 1;
+        jmp netdq_name_copy;
+
+      netdq_name_copy_done:
+        cmp rax, rbp;
+        jge netdq_name_last;              // that was the final label
+
+        mov rdx, rax;
+        add rdx, 1;                       // label_start = i + 1
+        mov rax, rdx;                     // i = i + 1 (skip the dot)
+        jmp netdq_name_loop;
+
+      netdq_name_last:
+        cmp r15, r9;
+        jge netdq_fail;                   // no room for the root byte
+        mov_b [r14 + r15], 0x00;          // root terminator
+        add r15, 1;
+
+        // --- QTYPE + QCLASS (reload fresh from params_ptr) ---
+        mov r8, r15;
+        add r8, 4;
+        cmp r8, r9;
+        jg  netdq_fail;                   // no room for QTYPE+QCLASS
+
+        mov r10, [r12 + 0];               // qtype
+        mov r11, r10;
+        shr r11, 8;
+        and r11, 0xff;
+        mov_b [r14 + r15], r11;           // qtype hi
+        add r15, 1;
+        and r10, 0xff;
+        mov_b [r14 + r15], r10;           // qtype lo
+        add r15, 1;
+
+        mov r10, [r12 + 8];               // qclass
+        mov r11, r10;
+        shr r11, 8;
+        and r11, 0xff;
+        mov_b [r14 + r15], r11;           // qclass hi
+        add r15, 1;
+        and r10, 0xff;
+        mov_b [r14 + r15], r10;           // qclass lo
+        add r15, 1;
+
+        mov [r13 + 0], r15;               // *out_len_ptr = total bytes
+        mov rax, 0x10;                    // DNSQ_OK
+
+        pop r13;
+        pop r12;
+        pop rbp;
+        pop rbx;
+        ret;
+
+      netdq_fail:
+        xor rax, rax;
+        mov [r13 + 0], rax;               // *out_len_ptr = 0 (fail-closed)
+        mov rax, 0x13;                    // DNSQ_ERR_ENCODE
+
+        pop r13;
+        pop r12;
+        pop rbp;
+        pop rbx;
+        ret
+      }
+    }
+
+}

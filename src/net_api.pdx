@@ -8,9 +8,9 @@
 //
 // Publishes the nine public entry-point symbols the R100 API
 // contract advertises to any consumer that statically links
-// libpdx-net. Every entry-point is a fail-closed stub at v0.2.0:
-// each function returns a `*_ERR_NOT_IMPL` sentinel from its
-// corresponding NetTypes.pdx band (NET/DNS/TLS) so a caller can
+// libpdx-net. At v0.2.0 every entry-point was a fail-closed stub:
+// each function returned a `*_ERR_NOT_IMPL` sentinel from its
+// corresponding NetTypes.pdx band (NET/DNS/TLS) so a caller could
 // discriminate "the SDK is a scaffold" from "the network refused
 // the operation" without inspecting a second slot.
 //
@@ -20,6 +20,21 @@
 // in-place body swap at the same symbol -- callers do not
 // re-link when M2-001..M2-007 or M3-001..M3-004 flip from stub
 // to real.
+//
+// M2-001 (#4) is the first of those swaps: `net_socket` /
+// `net_connect` / `net_send` / `net_recv` / `net_close` are now
+// real, one-hop delegations to net_tcp.pdx's `net_tcp_*` raw
+// syscall trampolines (SC+ 87/91/92/93/3) rather than
+// `mov rax,<NOT_IMPL>; ret` stubs -- see the "SWAP DISCIPLINE"
+// section below and net_tcp.pdx's own header for why the real
+// bodies live in a separate symbol rather than inline here.
+// `net_inet_pton` swaps too (M2-004, #7): it becomes a thin
+// adapter over net_inet.pdx's real `net_inet_pton_raw` engine
+// (module-suffixed there to dodge the same flat-global-symbol
+// collision net_tcp.pdx's `net_tcp_*` naming dodges), folding that
+// engine's out-pointer result back into this stub's original
+// two-argument, direct-return public contract. `net_bind`
+// (M2-002, #5), `net_resolve`, and `net_tls_wrap` remain stubs.
 //
 // =============================================================================
 // API CONTRACT (per plan §2.1)
@@ -49,10 +64,21 @@
 //
 // Each stub carries the target milestone in its justification so
 // a grep for the milestone id (`M2-001`, `M3-001`, ...) finds
-// every affected stub in one pass on landing. The real body
-// replaces the `mov rax, <NOT_IMPL>; ret` triplet in-place; the
-// register plan and stack-alignment discipline documented here
-// carries forward unchanged.
+// every affected stub in one pass on landing. Where the real
+// engine can share this file's exact argument registers with no
+// translation (M2-001's five SC+ trampolines), the swap replaces
+// the `mov rax, <NOT_IMPL>; ret` triplet in-place with a `sub
+// rsp,8; call <engine>; add rsp,8; ret` delegation to a
+// distinctly-named symbol in its own file (paideia-as has no
+// per-module symbol namespacing, so the real engine cannot reuse
+// this file's own symbol name once both land in the same
+// archive). Where the real engine's natural signature differs from
+// this file's original stub contract (M2-004's net_inet_pton,
+// whose real engine is out-pointer-shaped rather than
+// packed-return-shaped), the swap instead becomes a small adapter
+// that preserves this file's original public contract while
+// calling through to the differently-shaped engine. Either way,
+// callers linking against this file's symbols never re-link.
 //
 // =============================================================================
 // paideia-as compliance
@@ -62,14 +88,19 @@
 //   - Labels prefixed `libpdxnet_api_` -- disjoint from every other
 //     label prefix in this repo, avoids reserved keywords.
 //   - No `test rN, rN` -- cmp/je only (encoder pitfall).
-//   - Every immediate returned is a small u32 (0x0F/0x1F/0x2F);
-//     no MOVABS staging needed.
+//   - Every immediate returned/compared is a small u32 (0x00/0x01/
+//     0x0F/0x1F/0x2F); no MOVABS staging needed.
 //   - No `fn` with more than 4 curried args -- `net_tls_wrap` is
-//     at the ceiling; every other stub sits below.
-//   - No byte-register aliases (sil/dil/bl); no `neg`. Leaf stubs
-//     do not exercise either path.
+//     at the ceiling; every other entry sits below.
+//   - No byte-register aliases (sil/dil/bl); no `neg`.
 //   - String literals are absent from this file; every constant
 //     is a bare u64 immediate.
+//   - The five M2-001 delegations (net_socket/connect/send/recv/
+//     close) and the net_inet_pton adapter each bracket their one
+//     nested `call` with `sub rsp,8`/`add rsp,8` (delegations) or a
+//     2-push prologue + `sub rsp,24`/`add rsp,24` (the adapter's
+//     scratch buffer) -- entry rsp%16==8 in every case, landing
+//     rsp%16==0 immediately before the call.
 
 module NetApi = structure {
 
@@ -91,12 +122,14 @@ module NetApi = structure {
   // v1; other combinations refuse NET_ERR_INVAL. Returns a
   // fd cap-index on success. Blocked by libpdx-net.M2-001 (#4).
   // ==========================================================================
-  pub let net_socket : (u64, u64, u64) -> u64 !{} @{} =
+  pub let net_socket : (u64, u64, u64) -> u64 !{sysreg} @{} =
     fn (domain: u64, kind: u64, proto: u64) -> unsafe {
-      effects: {}, capabilities: {},
-      justification: "libpdx-net.M1-002 (#2) API stub for net_socket -- real body blocked on M2-001 (#4) SC+87 wrapper. Returns NET_ERR_NOT_IMPL (0x0F, small imm32); leaf, no stack, no callee-save. Labels prefixed libpdxnet_api_sock_.",
+      effects: {sysreg}, capabilities: {},
+      justification: "libpdx-net.M2-001 (#4) SWAP: net_socket now delegates to net_tcp.pdx's net_tcp_socket real SC+87 trampoline, per this file's own documented in-place-swap contract (real body lands at the same stable symbol; callers do not re-link). Landed as a separate net_tcp_* symbol rather than inline here to avoid a duplicate-definition link failure once this file and net_tcp.pdx join the same libpdx-net.a archive -- see net_tcp.pdx's own header for the full rationale. `sub rsp,8; call net_tcp_socket; add rsp,8; ret`: entry rsp%16==8 (no push), pad -> 0 for the call, undo after. Effects widen from `{}` to `{sysreg}` (propagated from net_tcp_socket's own syscall-issuing body). Args (rdi/rsi/rdx) pass through unchanged. No labels needed.",
       block: {
-        mov rax, 0x0F;                 // NET_ERR_NOT_IMPL
+        sub rsp, 8;
+        call net_tcp_socket;
+        add rsp, 8;
         ret
       }
     }
@@ -121,12 +154,14 @@ module NetApi = structure {
   //
   // Future body: SC+ 91 (sys_connect). Blocked on M2-001 (#4).
   // ==========================================================================
-  pub let net_connect : (u64, u64, u64) -> u64 !{} @{} =
+  pub let net_connect : (u64, u64, u64) -> u64 !{sysreg} @{} =
     fn (sock: u64, sa_va: u64, sa_len: u64) -> unsafe {
-      effects: {}, capabilities: {},
-      justification: "libpdx-net.M1-002 (#2) API stub for net_connect -- real body blocked on M2-001 (#4) SC+91 wrapper. Returns NET_ERR_NOT_IMPL (0x0F, small imm32); leaf. Labels prefixed libpdxnet_api_conn_.",
+      effects: {sysreg}, capabilities: {},
+      justification: "libpdx-net.M2-001 (#4) SWAP: net_connect now delegates to net_tcp.pdx's net_tcp_connect real SC+91 trampoline (same in-place-swap contract and duplicate-symbol rationale as net_socket above). `sub rsp,8; call net_tcp_connect; add rsp,8; ret`; args (rdi/rsi/rdx = sock/sa_va/sa_len, matching net_tcp_connect's fd/remote_ip/remote_port ABI) pass through unchanged. Effects widen from `{}` to `{sysreg}`. No labels needed.",
       block: {
-        mov rax, 0x0F;                 // NET_ERR_NOT_IMPL
+        sub rsp, 8;
+        call net_tcp_connect;
+        add rsp, 8;
         ret
       }
     }
@@ -138,12 +173,14 @@ module NetApi = structure {
   // actually sent (may be < buf_len for a short write); caller
   // loops on short writes. Blocked on M2-001 (#4).
   // ==========================================================================
-  pub let net_send : (u64, u64, u64) -> u64 !{} @{} =
+  pub let net_send : (u64, u64, u64) -> u64 !{sysreg} @{} =
     fn (sock: u64, buf_va: u64, buf_len: u64) -> unsafe {
-      effects: {}, capabilities: {},
-      justification: "libpdx-net.M1-002 (#2) API stub for net_send -- real body blocked on M2-001 (#4) SC+92 wrapper. Returns NET_ERR_NOT_IMPL (0x0F, small imm32); leaf. Labels prefixed libpdxnet_api_send_.",
+      effects: {sysreg}, capabilities: {},
+      justification: "libpdx-net.M2-001 (#4) SWAP: net_send now delegates to net_tcp.pdx's net_tcp_send real SC+92 trampoline (same in-place-swap contract and duplicate-symbol rationale as net_socket above). `sub rsp,8; call net_tcp_send; add rsp,8; ret`; args pass through unchanged. Effects widen from `{}` to `{sysreg}`. No labels needed.",
       block: {
-        mov rax, 0x0F;                 // NET_ERR_NOT_IMPL
+        sub rsp, 8;
+        call net_tcp_send;
+        add rsp, 8;
         ret
       }
     }
@@ -155,12 +192,14 @@ module NetApi = structure {
   // actually received; 0 means peer closed cleanly (mapped to
   // NET_ERR_CLOSED by the wrapper). Blocked on M2-001 (#4).
   // ==========================================================================
-  pub let net_recv : (u64, u64, u64) -> u64 !{} @{} =
+  pub let net_recv : (u64, u64, u64) -> u64 !{sysreg} @{} =
     fn (sock: u64, buf_va: u64, buf_len: u64) -> unsafe {
-      effects: {}, capabilities: {},
-      justification: "libpdx-net.M1-002 (#2) API stub for net_recv -- real body blocked on M2-001 (#4) SC+93 wrapper. Returns NET_ERR_NOT_IMPL (0x0F, small imm32); leaf. Labels prefixed libpdxnet_api_recv_.",
+      effects: {sysreg}, capabilities: {},
+      justification: "libpdx-net.M2-001 (#4) SWAP: net_recv now delegates to net_tcp.pdx's net_tcp_recv real SC+93 trampoline (same in-place-swap contract and duplicate-symbol rationale as net_socket above). `sub rsp,8; call net_tcp_recv; add rsp,8; ret`; args pass through unchanged. Effects widen from `{}` to `{sysreg}`. No labels needed.",
       block: {
-        mov rax, 0x0F;                 // NET_ERR_NOT_IMPL
+        sub rsp, 8;
+        call net_tcp_recv;
+        add rsp, 8;
         ret
       }
     }
@@ -171,12 +210,14 @@ module NetApi = structure {
   // Future body: SC+ 3 (sys_close, generic fd close). Not
   // milestoned separately; lands with M2-001 (#4).
   // ==========================================================================
-  pub let net_close : (u64) -> u64 !{} @{} =
+  pub let net_close : (u64) -> u64 !{sysreg} @{} =
     fn (sock: u64) -> unsafe {
-      effects: {}, capabilities: {},
-      justification: "libpdx-net.M1-002 (#2) API stub for net_close -- real body lands with M2-001 (#4) SC+3 (generic fd close). Returns NET_ERR_NOT_IMPL (0x0F, small imm32); leaf. Labels prefixed libpdxnet_api_close_.",
+      effects: {sysreg}, capabilities: {},
+      justification: "libpdx-net.M2-001 (#4) SWAP: net_close now delegates to net_tcp.pdx's net_tcp_close real SC+3 trampoline (same in-place-swap contract and duplicate-symbol rationale as net_socket above). `sub rsp,8; call net_tcp_close; add rsp,8; ret`; single arg (rdi=sock) passes through unchanged. Effects widen from `{}` to `{sysreg}`. No labels needed.",
       block: {
-        mov rax, 0x0F;                 // NET_ERR_NOT_IMPL
+        sub rsp, 8;
+        call net_tcp_close;
+        add rsp, 8;
         ret
       }
     }
@@ -184,18 +225,67 @@ module NetApi = structure {
   // ==========================================================================
   // net_inet_pton(str_va, str_len) -> u64
   //
-  // Future body: dotted-quad IPv4 parse (RFC 3986 §3.2.2 rule
-  // IPv4address). Returns the 32-bit IPv4 address in NETWORK
-  // byte order in the low 32 bits of rax; NET_ERR_INVAL (0x01)
-  // on any parse failure. No IPv6 at v1 per plan §2.2. Blocked
-  // on M2-004 (#7) -- pure function, no socket.
+  // SWAP (M2-004, #7): dotted-quad IPv4 parse. Real engine landed
+  // in net_inet.pdx as a THREE-argument, out-pointer-style
+  // `net_inet_pton(str_ptr, str_len, out_be_ptr) -> 0|1` (the
+  // canonical signature libpdx-net#7 specifies -- an out-pointer
+  // read/write-status shape rather than a packed-return, matching
+  // every other multi-output M2 function this same wave lands).
+  // That collides on the bare symbol name with THIS file's own
+  // two-argument `net_inet_pton` stub, so rather than rename either
+  // one, this stub becomes a thin ADAPTER: stack-allocate a 4-byte
+  // scratch buffer, call the real net_inet.pdx engine against it,
+  // then fold the 4 result bytes back into a single packed-u64
+  // return (network byte order: byte0 in bits[31:24] .. byte3 in
+  // bits[7:0]) to preserve THIS function's own original two-argument,
+  // direct-return public contract (the one downstream tools already
+  // link against per the "stable resolution TODAY" promise in this
+  // file's header). Returns the packed IPv4 address on success;
+  // NET_ERR_INVAL (0x01) on any parse failure. No IPv6 at v1 per
+  // plan §2.2.
   // ==========================================================================
-  pub let net_inet_pton : (u64, u64) -> u64 !{} @{} =
+  pub let net_inet_pton : (u64, u64) -> u64 !{mem} @{} =
     fn (str_va: u64, str_len: u64) -> unsafe {
-      effects: {}, capabilities: {},
-      justification: "libpdx-net.M1-002 (#2) API stub for net_inet_pton -- real body blocked on M2-004 (#7) dotted-quad parser (pure function, no socket). Returns NET_ERR_NOT_IMPL (0x0F, small imm32); leaf. Labels prefixed libpdxnet_api_pton_.",
+      effects: {mem}, capabilities: {},
+      justification: "libpdx-net.M2-004 (#7) SWAP: net_inet_pton adapter over net_inet.pdx's real 3-arg out-pointer engine (named net_inet_pton_raw there specifically to avoid colliding with THIS symbol -- paideia-as has no per-module symbol namespacing, so the two could not both be called net_inet_pton). 2-push callee-save (rbx=str_va, rbp=str_len) then `sub rsp,24` (16-byte scratch buffer for the engine's out_be_ptr + 8 bytes to reach 16-alignment: entry rsp%16==8, two pushes land rsp%16==8, sub 24 -> 0) before `call net_inet_pton_raw` (rdi=rbx, rsi=rbp, rdx=rsp -- the scratch buffer's own address). On rax==0 (success), the 4 bytes at [rsp+0..3] are folded into a single packed-u64 return via four xor-then-mov_b zero-extending loads (#1248 workaround) combined with `shl rax,8; or rax,rcx` per byte, producing byte0<<24|byte1<<16|byte2<<8|byte3 -- the same big-endian-packed-in-a-u64 reading this stub's ORIGINAL (pre-swap) doc comment always promised. On rax!=0 (parse failure), returns NET_ERR_INVAL (0x01) directly without touching the scratch bytes. `add rsp,24; pop rbp; pop rbx; ret` on every path. No `test rN,rN`. Labels prefixed libpdxnet_api_pton_.",
       block: {
-        mov rax, 0x0F;                 // NET_ERR_NOT_IMPL
+        push rbx;
+        push rbp;
+        mov rbx, rdi;                    // str_va
+        mov rbp, rsi;                    // str_len
+
+        sub rsp, 24;                     // scratch[0..3] + alignment pad
+
+        mov rdi, rbx;
+        mov rsi, rbp;
+        mov rdx, rsp;                    // out_be_ptr = scratch buffer
+        call net_inet_pton_raw;
+        cmp rax, 0;
+        jne libpdxnet_api_pton_fail;
+
+        xor rax, rax;
+        mov_b rax, [rsp + 0];            // byte0
+        xor rcx, rcx;
+        mov_b rcx, [rsp + 1];            // byte1
+        shl rax, 8;
+        or  rax, rcx;
+        xor rcx, rcx;
+        mov_b rcx, [rsp + 2];            // byte2
+        shl rax, 8;
+        or  rax, rcx;
+        xor rcx, rcx;
+        mov_b rcx, [rsp + 3];            // byte3
+        shl rax, 8;
+        or  rax, rcx;
+        jmp libpdxnet_api_pton_done;
+
+      libpdxnet_api_pton_fail:
+        mov rax, 1;                      // NET_ERR_INVAL
+
+      libpdxnet_api_pton_done:
+        add rsp, 24;
+        pop rbp;
+        pop rbx;
         ret
       }
     }
@@ -203,16 +293,21 @@ module NetApi = structure {
   // ==========================================================================
   // net_resolve(name_va, name_len, out_va) -> u64
   //
-  // Future body: build DNS query (M2-005 #8), send over UDP
-  // (M2-007 #10), parse response (M2-006 #9), verify TXID
-  // (M3-006 #16 -- already landed). Stores the first A record
+  // Future body: build DNS query (M2-005 #8 -- LANDED, see
+  // net_dns_query.pdx's net_dns_build_query), send over UDP
+  // (M2-007 #10 -- still open), parse response (M2-006 #9 --
+  // LANDED, see net_dns_parse.pdx's net_dns_parse_response), verify
+  // TXID (M3-006 #16 -- already landed). Stores the first A record
   // (4 bytes) at out_va on success. Returns DNS_OK / DNS_ERR_*.
-  // Blocked on M2-005/006/007 (#8/#9/#10) plus R100-PREP-002.
+  // Still blocked on M2-007 (#10) plus R100-PREP-002
+  // (UDP-via-socket) -- the two pure encode/decode halves this
+  // function will compose now both exist, but nothing yet puts a
+  // packet on the wire.
   // ==========================================================================
   pub let net_resolve : (u64, u64, u64) -> u64 !{} @{} =
     fn (name_va: u64, name_len: u64, out_va: u64) -> unsafe {
       effects: {}, capabilities: {},
-      justification: "libpdx-net.M1-002 (#2) API stub for net_resolve -- real body blocked on M2-005/006/007 (#8/#9/#10) plus R100-PREP-002 UDP-via-socket. Returns DNS_ERR_NOT_IMPL (0x1F, small imm32) from the DnsErr band so a caller who folds through the single-u64 return slot sees the failing layer immediately. Leaf. Labels prefixed libpdxnet_api_resolve_.",
+      justification: "libpdx-net.M1-002 (#2) API stub for net_resolve -- real body blocked on M2-007 (#10) UDP send/recv plus R100-PREP-002 UDP-via-socket. M2-005 (#8) and M2-006 (#9), the query-build and response-parse halves, landed separately in net_dns_query.pdx / net_dns_parse.pdx; this stub is not yet swapped because there is still no UDP transport to drive them over. Returns DNS_ERR_NOT_IMPL (0x1F, small imm32) from the DnsErr band so a caller who folds through the single-u64 return slot sees the failing layer immediately. Leaf. Labels prefixed libpdxnet_api_resolve_.",
       block: {
         mov rax, 0x1F;                 // DNS_ERR_NOT_IMPL
         ret

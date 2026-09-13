@@ -20,23 +20,32 @@
 # -- the mkfs.pdxfs pattern (parses, does not transmit, ships anyway).
 
 name        = libpdx-net
-version     = 0.2.0
+version     = 0.3.0
 kind        = shared-library
 output      = build-out/libpdx-net.a
 caps_decl   = caps.decl
 
 # --- Source list -------------------------------------------------------
 # Order-insensitive; paideia-as resolves module deps from
-# `module <Basename> = structure { ... }` headers.
+# `module <Basename> = structure { ... }` headers. net_api.pdx's
+# net_socket/connect/send/recv/close and net_inet_pton now CALL
+# symbols defined in net_tcp.pdx / net_inet.pdx respectively --
+# order-insensitivity means this list does not need to reflect that,
+# but the final `ld` step needs every listed object in the archive.
 sources:
   - src/tool_ident.pdx          # PDX_TOOL_NAME / PDX_TOOL_VERSION externs
   - src/net_types.pdx           # NetErr/DnsErr/TlsErr/HttpErr enum tags
-  - src/net_api.pdx             # M1-002 public API stubs (#2)
+  - src/net_api.pdx             # M1-002 public API stubs (#2); M2-001/M2-004 swaps
   - src/net_tls_record.pdx      # M3-005: TlsHandshakeRecord@0.1 schema + emit (#15)
   - src/net_dns_txid.pdx        # M3-006: resolver TXID randomize + verify (#16)
   - src/net_http_request.pdx    # M4-001 GET encode + M4-002 POST encode (#17/#18)
   - src/net_http_response.pdx   # M4-001 status-line + header decode (#17)
   - src/net_http_chunked.pdx    # M4-003 chunked transfer-encoding decode (#19)
+  - src/net_tcp.pdx             # M2-001: real socket/connect/send/recv/close trampolines (#4)
+  - src/net_endian.pdx          # M2-003: htons/ntohs/htonl/ntohl (#6)
+  - src/net_inet.pdx            # M2-004: dotted-quad IPv4 parse engine (#7)
+  - src/net_dns_query.pdx       # M2-005: DNS query builder (#8)
+  - src/net_dns_parse.pdx       # M2-006: DNS response parser (#9)
 
 # --- Library dependencies ---------------------------------------------
 # libpdx-net at v0.2.0 depends on nothing outside the SC+ syscall

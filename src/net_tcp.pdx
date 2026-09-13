@@ -1,0 +1,172 @@
+// src/net_tcp.pdx -- libpdx-net.M2-001 (libpdx-net#4)
+//
+// Real TCP wrapper: raw syscall trampolines for socket/connect/send/
+// recv/close over SC+ 87/91/92/93/3.
+//
+// =============================================================================
+// SCOPE
+// =============================================================================
+//
+// paideia-os's socket family (src/kernel/core/syscall/handlers/
+// sys_{socket,connect,send,recv}.pdx, R72.M1-005 / #1927) already
+// confirms the exact three-argument ABI each of these five syscalls
+// takes, and every one of those three arguments already lands in
+// rdi/rsi/rdx -- both the SysV curried-fn argument registers AND the
+// SysV `syscall` argument registers agree at this arity, so no
+// register shuffling is needed between "the arguments this function
+// was called with" and "the arguments the syscall instruction reads".
+// Each trampoline is therefore exactly the three-instruction shape
+// the issue names: `mov rax, <sysno>; syscall; ret`.
+//
+//   net_tcp_socket (domain, sock_type, proto)   -> u64   SC+ 87
+//   net_tcp_connect(fd, remote_ip, remote_port) -> u64   SC+ 91
+//   net_tcp_send   (fd, buf_va, len)            -> u64   SC+ 92
+//   net_tcp_recv   (fd, buf_va, len)            -> u64   SC+ 93
+//   net_tcp_close  (fd)                         -> u64   SC+  3
+//
+// Signature confirmation (grepped against the live kernel handlers,
+// not just their file-header prose, per this repo's own
+// trust-the-live-code discipline -- see mount.pdxfs's mount_op.pdx
+// KERNEL GAP #1 note for why that distinction matters):
+//   sys_socket.pdx  L4: "sys_socket(domain, type, proto) -> cap_slot | -errno. SC+ ID 87."
+//   sys_connect.pdx L4: "sys_connect(fd, remote_ip, remote_port) -> 0 | -errno. SC+ ID 91."
+//   sys_send.pdx    L4: "sys_send(fd, buf_va, len) -> bytes_sent | -errno. SC+ ID 92."
+//   sys_recv.pdx    L4: "sys_recv(fd, buf_va, len) -> bytes_read | -errno. SC+ ID 93."
+//   (sys_close is the generic fd-close syscall, SC+ ID 3, single
+//   argument -- the same sysno net_api.pdx's own net_close stub
+//   justification already cites.)
+//
+// The return value convention is whatever the kernel handler puts in
+// rax: a non-negative result (cap_slot / 0 / bytes_sent / bytes_read)
+// on success, or a negative errno-shaped value (two's-complement, so
+// still a well-formed u64 from this trampoline's point of view) on
+// failure. This file does not interpret that value at all -- it is
+// a raw pass-through trampoline layer; NetTypes.NetErr-band
+// translation (if any future caller wants one) belongs at the
+// net_api.pdx façade, not here.
+//
+// -----------------------------------------------------------------------------
+// Symbol-collision avoidance: distinctly-named backing module,
+// net_api.pdx swapped in place
+// -----------------------------------------------------------------------------
+//
+// net_api.pdx already publishes PUBLIC stub symbols named exactly
+// `net_socket` / `net_connect` / `net_send` / `net_recv` / `net_close`
+// -- the stable names downstream tools (pdxcurl, pdxdig, pdxsock,
+// ...) already link against, per that file's own "SWAP DISCIPLINE"
+// section: "The real body replaces the `mov rax, <NOT_IMPL>; ret`
+// triplet in-place; ... callers do not re-link." Landing a SECOND
+// definition of those same five symbols in this file would be a
+// duplicate-symbol link failure the moment both object files join
+// the same `libpdx-net.a` archive.
+//
+// This file therefore publishes the five real bodies under
+// `net_tcp_*` names, and net_api.pdx's own five stubs are updated
+// (this same landing) to delegate to them via a `sub rsp,8; call
+// net_tcp_*; add rsp,8; ret` shim -- fulfilling net_api.pdx's own
+// documented in-place-swap contract at the STABLE symbol names its
+// callers already hold, while keeping this file's real syscall
+// bodies collision-free. See net_api.pdx's own module header for the
+// updated swap-site commentary.
+//
+// =============================================================================
+// paideia-as compliance
+// =============================================================================
+//
+//   - Module name PascalCase basename (`NetTcp`) matches file.
+//   - No labels anywhere in this file -- every trampoline is
+//     straight-line (mov + syscall + ret), nothing to prefix; the
+//     reserved-label convention for this module is `nettcp_` should
+//     a future branch land here.
+//   - No `test rN, rN`; no comparisons at all in this file.
+//   - Every syscall number (87, 91, 92, 93, 3) is a small imm32 --
+//     no MOVABS staging.
+//   - `effects: {sysreg}` on every trampoline -- executing `syscall`
+//     is the documented trigger for the `sysreg` effect tag
+//     elsewhere in this tree (design/kernel/r17-m2-736-...: "`sysreg`
+//     for the syscall"); none of these five trampolines dereferences
+//     a pointer itself (the buf_va/remote_ip arguments are opaque
+//     pass-through values the KERNEL dereferences), so no `mem`
+//     effect is claimed here.
+//   - `capabilities: {}` -- these five syscalls are ambient/ungated
+//     at the syscall-entry level (no `KIND_*` capability slot is
+//     consumed by this trampoline layer itself; the kernel handlers'
+//     own internal `@{cap}` annotations describe THEIR capability-
+//     table bookkeeping, not a permission this userspace caller must
+//     hold to issue the syscall). Matches this repo's caps.decl
+//     posture for the other ambient syscalls already in file
+//     (sys_getpid / sys_hpet_now_ns, SC+ 39 / 45).
+
+module NetTcp = structure {
+
+  // ============================================================================
+  // net_tcp_socket(domain, sock_type, proto) -> u64   SC+ ID 87
+  // ============================================================================
+  pub let net_tcp_socket : (u64, u64, u64) -> u64 !{sysreg} @{} =
+    fn (domain: u64, sock_type: u64, proto: u64) -> unsafe {
+      effects: {sysreg}, capabilities: {},
+      justification: "libpdx-net.M2-001 (#4): raw sys_socket trampoline, SC+ ID 87. rdi=domain, rsi=sock_type, rdx=proto already sit in the exact registers the syscall reads -- no shuffling. `mov rax,87; syscall; ret`. Return value (cap_slot on success, negative errno on failure) passed through unexamined. Leaf, no branch, nothing to label.",
+      block: {
+        mov rax, 87;
+        syscall;
+        ret
+      }
+    }
+
+  // ============================================================================
+  // net_tcp_connect(fd, remote_ip, remote_port) -> u64   SC+ ID 91
+  // ============================================================================
+  pub let net_tcp_connect : (u64, u64, u64) -> u64 !{sysreg} @{} =
+    fn (fd: u64, remote_ip: u64, remote_port: u64) -> unsafe {
+      effects: {sysreg}, capabilities: {},
+      justification: "libpdx-net.M2-001 (#4): raw sys_connect trampoline, SC+ ID 91. rdi=fd, rsi=remote_ip (packed u32, normal dotted-quad byte order per sys_connect.pdx's own header), rdx=remote_port already sit in the syscall's argument registers. `mov rax,91; syscall; ret`. Return value (0 on success, negative errno on failure) passed through unexamined. Leaf, no branch, nothing to label.",
+      block: {
+        mov rax, 91;
+        syscall;
+        ret
+      }
+    }
+
+  // ============================================================================
+  // net_tcp_send(fd, buf_va, len) -> u64   SC+ ID 92
+  // ============================================================================
+  pub let net_tcp_send : (u64, u64, u64) -> u64 !{sysreg} @{} =
+    fn (fd: u64, buf_va: u64, len: u64) -> unsafe {
+      effects: {sysreg}, capabilities: {},
+      justification: "libpdx-net.M2-001 (#4): raw sys_send trampoline, SC+ ID 92. rdi=fd, rsi=buf_va, rdx=len already sit in the syscall's argument registers -- this trampoline never dereferences buf_va itself (the kernel handler does, via its own user_read_bytes_via_walk bounce-buffer copy per sys_send.pdx), so it claims `sysreg` only, not `mem`. `mov rax,92; syscall; ret`. Return value (bytes_sent on success, negative errno on failure) passed through unexamined. Leaf, no branch, nothing to label.",
+      block: {
+        mov rax, 92;
+        syscall;
+        ret
+      }
+    }
+
+  // ============================================================================
+  // net_tcp_recv(fd, buf_va, len) -> u64   SC+ ID 93
+  // ============================================================================
+  pub let net_tcp_recv : (u64, u64, u64) -> u64 !{sysreg} @{} =
+    fn (fd: u64, buf_va: u64, len: u64) -> unsafe {
+      effects: {sysreg}, capabilities: {},
+      justification: "libpdx-net.M2-001 (#4): raw sys_recv trampoline, SC+ ID 93. rdi=fd, rsi=buf_va, rdx=len already sit in the syscall's argument registers; same no-dereference-here rationale as net_tcp_send above (the kernel handler owns the buf_va write). `mov rax,93; syscall; ret`. Return value (bytes_read on success, 0 on clean peer-close, negative errno on failure) passed through unexamined. Leaf, no branch, nothing to label.",
+      block: {
+        mov rax, 93;
+        syscall;
+        ret
+      }
+    }
+
+  // ============================================================================
+  // net_tcp_close(fd) -> u64   SC+ ID 3
+  // ============================================================================
+  pub let net_tcp_close : (u64) -> u64 !{sysreg} @{} =
+    fn (fd: u64) -> unsafe {
+      effects: {sysreg}, capabilities: {},
+      justification: "libpdx-net.M2-001 (#4): raw sys_close trampoline (generic fd close), SC+ ID 3 -- the same sysno net_api.pdx's own net_close stub justification already names as its future body. rdi=fd already sits in the syscall's argument register. `mov rax,3; syscall; ret`. Return value passed through unexamined. Leaf, no branch, nothing to label.",
+      block: {
+        mov rax, 3;
+        syscall;
+        ret
+      }
+    }
+
+}

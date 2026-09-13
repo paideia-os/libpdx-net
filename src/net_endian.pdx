@@ -1,0 +1,201 @@
+// src/net_endian.pdx -- libpdx-net.M2-003 (libpdx-net#6)
+//
+// Host<->network byte-order helpers: net_htons / net_ntohs / net_htonl /
+// net_ntohl.
+//
+// =============================================================================
+// SCOPE (design/networking/r100-user-tools-plan.md -- M2 pure-function
+// cohort)
+// =============================================================================
+//
+// paideia-os runs x86_64 (little-endian). Every wire protocol this
+// library touches (IPv4 addresses, DNS header fields, TCP/UDP port
+// numbers) is big-endian ("network byte order") per RFC 1700 / BSD
+// sockets convention. These four helpers are the shared primitive
+// every other M2/M3/M4 module composes: net_dns_query.pdx BE-packs
+// QTYPE/QCLASS, net_dns_parse.pdx BE-unpacks header counts, and any
+// future net_ip.pdx would BE-pack a port number the same way.
+//
+// A 16-bit byte swap is its own inverse (swap(swap(x)) == x), so
+// net_ntohs shares net_htons's body exactly; same for
+// net_htonl/net_ntohl at 32 bits. Each pair is nonetheless landed as
+// two independently-named symbols (rather than one aliased twice) so
+// a caller reads intent at the call site (`net_htons(port)` vs.
+// `net_ntohs(wire_val)`) without a mental note that the two names
+// happen to collapse to the same body.
+//
+// -----------------------------------------------------------------------------
+// Why manual shl/shr/and/or instead of bswap
+// -----------------------------------------------------------------------------
+//
+// `src/kernel/core/net/ethernet.pdx` (R27-M3-001, #981) already
+// landed exactly this tradeoff for the kernel's own `htons`: paideia-as
+// encodes `bswap_d` (32-bit) and `bswap r64`, but no production `.pdx`
+// body anywhere in the paideia-os tree actually exercises either
+// mnemonic yet -- every real byte-swap body uses shl/shr/and/or on
+// caller-save registers instead. This file follows that same
+// SAFE-INSTRUCTION-SET discipline rather than being the first
+// consumer of an unproven mnemonic in a library meant to be linked
+// into every future R100 network tool. The 32-bit swap
+// (net_htonl/net_ntohl) is the direct 4-byte generalization of
+// ethernet.pdx's proven 2-byte swap.
+//
+// =============================================================================
+// paideia-as compliance
+// =============================================================================
+//
+//   - Module name PascalCase basename (`NetEndian`) matches file.
+//   - No labels needed -- every function is straight-line (no
+//     branches), so there is nothing to prefix; the reserved-label
+//     convention for this module is `netend_` should any future
+//     branch land here.
+//   - No `test rN, rN` -- this file uses no comparisons at all.
+//   - No `bswap` / `bswap_d` -- manual shl/shr/and/or per the header
+//     note above.
+//   - Every immediate (0xFF, 8, 24, 0xFF00, 0xFF0000) is a small
+//     imm32 -- no MOVABS staging needed anywhere in this file.
+//   - No byte-register aliases (sil/dil/bl); no `neg`; no `and
+//     r8-r15, imm64` (r8-r11 are used, but every AND here is a
+//     single-byte-range imm32, and net_htonl/net_ntohl mask with
+//     0xFF/0xFF00/0xFF0000, none of which trip the wide-imm64
+//     AND-on-extended-register encoder gap).
+//   - Four args max not approached -- every function here is unary.
+
+module NetEndian = structure {
+
+  // ============================================================================
+  // net_htons(val) -> u64 -- host-to-network 16-bit byte swap
+  // ============================================================================
+  //
+  // rdi = value (low 16 bits meaningful; upper bits ignored on input)
+  // Returns rax = byte-swapped u16 in the low 16 bits; upper bits
+  // guaranteed zero.
+  //
+  // Leaf, no branches, no callee-save.
+  // ============================================================================
+  pub let net_htons : (u64) -> u64 !{} @{} =
+    fn (val: u64) -> unsafe {
+      effects: {}, capabilities: {},
+      justification: "libpdx-net.M2-003 (#6): host-to-network u16 byte swap, same shape as src/kernel/core/net/ethernet.pdx's proven htons (R27-M3-001 / #981) -- manual shl/shr/and/or rather than bswap (no production .pdx body anywhere in the tree exercises bswap yet; see file header). Body: mov rax,rdi (stage input); mov rcx,rax (copy for high-byte extraction); and rax,0xFF (isolate low byte); shl rax,8 (low byte -> bits[15:8]); shr rcx,8 (high byte -> bits[7:0] of rcx, upper bits still caller garbage); and rcx,0xFF (drop that garbage); or rax,rcx (combine). Every immediate (0xFF, 8) is single-byte imm32. Leaf -- rax/rcx both caller-save, no push/pop, no branch, nothing to label.",
+      block: {
+        mov rax, rdi;
+        mov rcx, rax;
+        and rax, 0xFF;
+        shl rax, 8;
+        shr rcx, 8;
+        and rcx, 0xFF;
+        or  rax, rcx;
+        ret
+      }
+    }
+
+  // ============================================================================
+  // net_ntohs(val) -> u64 -- network-to-host 16-bit byte swap
+  // ============================================================================
+  //
+  // A 16-bit byte swap is its own inverse; body is byte-identical to
+  // net_htons above. Landed as an independently-named symbol so call
+  // sites read direction of travel.
+  // ============================================================================
+  pub let net_ntohs : (u64) -> u64 !{} @{} =
+    fn (val: u64) -> unsafe {
+      effects: {}, capabilities: {},
+      justification: "libpdx-net.M2-003 (#6): network-to-host u16 byte swap. A 2-byte swap is self-inverse, so this body is byte-identical to net_htons above (see that function's justification for the full instruction-by-instruction rationale). Landed as an independently-named symbol rather than an alias so net_ntohs(wire_val) reads as 'convert a value just read off the wire' at call sites, distinct from net_htons(host_val)'s 'convert a value about to go on the wire'. Leaf, no branches, nothing to label.",
+      block: {
+        mov rax, rdi;
+        mov rcx, rax;
+        and rax, 0xFF;
+        shl rax, 8;
+        shr rcx, 8;
+        and rcx, 0xFF;
+        or  rax, rcx;
+        ret
+      }
+    }
+
+  // ============================================================================
+  // net_htonl(val) -> u64 -- host-to-network 32-bit byte swap
+  // ============================================================================
+  //
+  // rdi = value (low 32 bits meaningful; upper bits ignored on input)
+  // Returns rax = byte-swapped u32 in the low 32 bits; upper bits
+  // guaranteed zero.
+  //
+  // Direct 4-byte generalization of net_htons above: isolate each of
+  // the four bytes B0(bits[7:0])..B3(bits[31:24]) independently via
+  // and+shift, then OR the four results together at their reversed
+  // positions (B0->[31:24], B1->[23:16], B2->[15:8], B3->[7:0]).
+  // Four independent extractions (rather than net_htons's
+  // extract-swap-swap-combine) keep every intermediate value in its
+  // own register with no read-after-write hazard between them.
+  //
+  // Leaf, no branches, no callee-save (r8-r11 are caller-save
+  // scratch, freely clobbered).
+  // ============================================================================
+  pub let net_htonl : (u64) -> u64 !{} @{} =
+    fn (val: u64) -> unsafe {
+      effects: {}, capabilities: {},
+      justification: "libpdx-net.M2-003 (#6): host-to-network u32 byte swap, the 4-byte generalization of this file's own net_htons. rdi is never overwritten so every one of the four extractions reads the untouched original value. r8 = (rdi & 0xFF) << 24 -- B0 to the top byte. r9 = (rdi & 0xFF00) << 8 -- B1 (bits[15:8]) to bits[23:16]. r10 = (rdi & 0xFF0000) >> 8 -- B2 (bits[23:16]) to bits[15:8]. r11 = (rdi >> 24) & 0xFF -- B3 (bits[31:24]) to bits[7:0]. rax = r8 | r9 | r10 | r11. Every immediate (0xFF, 0xFF00, 0xFF0000, 8, 24) is a small imm32 -- no MOVABS staging. `and r8,imm32` / `and r9,imm32` are the encoder-proven form (the banned pattern is AND with a full imm64 on r8-r15, not a small imm32). Leaf -- r8-r11 all caller-save, no push/pop, no branch, nothing to label.",
+      block: {
+        mov r8, rdi;
+        and r8, 0xFF;
+        shl r8, 24;
+
+        mov r9, rdi;
+        and r9, 0xFF00;
+        shl r9, 8;
+
+        mov r10, rdi;
+        and r10, 0xFF0000;
+        shr r10, 8;
+
+        mov r11, rdi;
+        shr r11, 24;
+        and r11, 0xFF;
+
+        mov rax, r8;
+        or  rax, r9;
+        or  rax, r10;
+        or  rax, r11;
+        ret
+      }
+    }
+
+  // ============================================================================
+  // net_ntohl(val) -> u64 -- network-to-host 32-bit byte swap
+  // ============================================================================
+  //
+  // A 32-bit byte swap is its own inverse; body is byte-identical to
+  // net_htonl above. Landed as an independently-named symbol so call
+  // sites read direction of travel.
+  // ============================================================================
+  pub let net_ntohl : (u64) -> u64 !{} @{} =
+    fn (val: u64) -> unsafe {
+      effects: {}, capabilities: {},
+      justification: "libpdx-net.M2-003 (#6): network-to-host u32 byte swap. A 4-byte swap is self-inverse, so this body is byte-identical to net_htonl above (see that function's justification for the full instruction-by-instruction rationale). Landed as an independently-named symbol rather than an alias for the same wire-direction-at-a-glance reason as net_ntohs. Leaf, no branches, nothing to label.",
+      block: {
+        mov r8, rdi;
+        and r8, 0xFF;
+        shl r8, 24;
+
+        mov r9, rdi;
+        and r9, 0xFF00;
+        shl r9, 8;
+
+        mov r10, rdi;
+        and r10, 0xFF0000;
+        shr r10, 8;
+
+        mov r11, rdi;
+        shr r11, 24;
+        and r11, 0xFF;
+
+        mov rax, r8;
+        or  rax, r9;
+        or  rax, r10;
+        or  rax, r11;
+        ret
+      }
+    }
+
+}

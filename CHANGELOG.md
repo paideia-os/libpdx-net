@@ -3,6 +3,68 @@
 All notable changes to this repository are documented here. Versioning
 follows SemVer with a v0.x series until the M5 signed release.
 
+## [0.3.0] -- 2026-09-13 (Wave MM: M2 pure-function cohort)
+
+**Scope:** land five M2 issues -- the first real (non-stub) bodies
+in this library. `net_socket`/`net_connect`/`net_send`/`net_recv`/
+`net_close`/`net_inet_pton` on the public `net_api.pdx` surface
+swap from `NOT_IMPL` stubs to real bodies, in place, at the same
+stable symbols.
+
+### Landed
+
+- `#4` -- **M2-001 real TCP wrapper.** `src/net_tcp.pdx` (module
+  `NetTcp`) publishes five raw syscall trampolines --
+  `net_tcp_socket`/`net_tcp_connect`/`net_tcp_send`/`net_tcp_recv`/
+  `net_tcp_close` over SC+ 87/91/92/93/3 -- each a bare `mov rax,
+  <sysno>; syscall; ret` (every argument already sits in the
+  registers both the curried-fn ABI and the syscall ABI agree on, so
+  no shuffling is needed). Landed under `net_tcp_*` names rather
+  than net_api.pdx's own `net_socket`/etc. to avoid a duplicate-
+  symbol link failure (paideia-as has no per-module symbol
+  namespacing); `net_api.pdx`'s five corresponding stubs are swapped,
+  this same landing, to delegate to these trampolines, fulfilling
+  that file's own documented in-place-swap contract.
+
+- `#6` -- **M2-003 endian helpers.** `src/net_endian.pdx` (module
+  `NetEndian`) publishes `net_htons`/`net_ntohs`/`net_htonl`/
+  `net_ntohl`, all `(u64) -> u64` leaf functions. Manual shl/shr/
+  and/or byte-swap (the same proven shape `src/kernel/core/net/
+  ethernet.pdx`'s own `htons` already uses) rather than `bswap` --
+  no production `.pdx` body anywhere in the tree exercises that
+  mnemonic yet.
+
+- `#7` -- **M2-004 net_inet_pton.** `src/net_inet.pdx` (module
+  `NetInet`) publishes the real dotted-quad IPv4 parse engine,
+  `net_inet_pton_raw(str_ptr, str_len, out_be_ptr) -> 0|1`
+  (out-pointer-shaped per the issue's own contract; suffixed `_raw`
+  to avoid colliding with net_api.pdx's differently-shaped, older
+  `net_inet_pton` stub). `net_api.pdx`'s `net_inet_pton` becomes a
+  thin adapter: stack-scratch buffer, call the `_raw` engine, fold
+  the 4 result bytes back into that stub's original packed-return
+  contract.
+
+- `#8` -- **M2-005 DNS query builder.** `src/net_dns_query.pdx`
+  (module `NetDnsQuery`) publishes `net_dns_build_query(name_ptr,
+  name_len, params_ptr, out_len_ptr) -> u64`, emitting the 12-byte
+  RFC 1035 header (TXID sourced from the already-landed
+  `net_dns_txid_next`, not a fresh entropy read) plus one RFC 1035
+  label-encoded question. Real signature packs qtype/qclass/out_ptr/
+  out_max into a caller-owned struct behind `params_ptr` rather than
+  the issue's literal 7-argument listing, which exceeds the
+  paideia-as 4-argument curried-fn ceiling.
+
+- `#9` -- **M2-006 DNS response parser.** `src/net_dns_parse.pdx`
+  (module `NetDnsParse`) publishes `net_dns_parse_response(pkt_ptr,
+  pkt_len, out_addr_ptr, out_cname_ptr) -> u64` (always returns
+  RCODE, or 0xFF for a too-short header), backed by two new reusable
+  primitives: `net_dns_parse_skip_name` (measure past a name without
+  following compression pointers) and `net_dns_parse_decode_name`
+  (full pointer-following decompression, 32-hop cycle guard, RFC
+  1035's 255-byte name cap). Extracts the first answer's A-record
+  address or decompresses a CNAME target; both output buffers are
+  zeroed at entry so every return path leaves them well-defined.
+
 ## [0.2.0] -- 2026-09-13 (Wave X drain)
 
 **Scope:** drain five remaining M1 / M5 open issues after Wave N.

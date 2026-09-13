@@ -4,18 +4,40 @@
 # Doc:  design/networking/r100-user-tools-plan.md §2 + §10 + §12
 #       (paideia-os monorepo).
 #
-# libpdx-net is a shared library that will front the SC+ socket
-# family (SC+ 87..94 -- sys_socket / bind / listen / accept / connect
-# / send / recv / shutdown) plus the generic fd close (SC+ 3) for the
-# TCP/UDP wrappers, the same UDP path once R100-PREP-002 lands for
-# the resolver, and the ChaCha20-Poly1305 AEAD intrinsic (paideia-as
-# ChaCha20Poly1305::seal/open, landed #1305/v0.33-004) for the TLS
-# record layer. The scaffold seed (v0.1.0) consumes NONE of those
-# syscalls directly -- every function shipped is either a pure
-# transformation over caller-provided byte buffers or a fail-closed
-# stub whose real body will land after the R100 PREP items resolve.
+# libpdx-net is a shared library that fronts the SC+ socket family
+# (SC+ 87..94 -- sys_socket / bind / listen / accept / connect /
+# send / recv / shutdown) plus the generic fd close (SC+ 3), the
+# same UDP path once R100-PREP-002 lands for the resolver, and the
+# ChaCha20-Poly1305 AEAD intrinsic (paideia-as ChaCha20Poly1305::
+# seal/open, landed #1305/v0.33-004) for the TLS record layer.
 #
-# Two syscalls the scaffold seed DOES consume for the resolver TXID
+# As of v0.3.0 (Wave MM, M2-001 #4), net_tcp.pdx's five trampolines
+# DO consume five of those syscalls directly:
+#
+#   * `sys_socket`  (SC+ ID 87) -- net_tcp_socket
+#   * `sys_connect` (SC+ ID 91) -- net_tcp_connect
+#   * `sys_send`    (SC+ ID 92) -- net_tcp_send
+#   * `sys_recv`    (SC+ ID 93) -- net_tcp_recv
+#   * `sys_close`   (SC+ ID 3)  -- net_tcp_close
+#
+# All five are ambient at the syscall-entry level (no `KIND_*`
+# capability slot gates the trampoline itself -- see
+# src/kernel/core/syscall/handlers/sys_{socket,connect,send,recv}.pdx,
+# none of which cap-checks its own three-argument entry the way e.g.
+# sys_mount does), matching the posture already documented below for
+# sys_getpid/sys_hpet_now_ns. net_api.pdx's net_socket/connect/send/
+# recv/close now delegate to these five trampolines (in-place swap
+# over the M1-002 stubs); every other net_bind/net_resolve/
+# net_tls_wrap stub in net_api.pdx remains unswapped.
+#
+# net_bind/listen/accept/shutdown (SC+ 88/89/90/94) and the UDP path
+# remain unconsumed pending their own milestones (M2-002 #5 and
+# R100-PREP-002 respectively) -- every OTHER function shipped is
+# either a pure transformation over caller-provided byte buffers or
+# a fail-closed stub whose real body will land after the R100 PREP
+# items resolve.
+#
+# Two syscalls the library ALSO consumes for the resolver TXID
 # path (M3-006, net_dns_txid.pdx):
 #
 #   * `sys_getpid` (SC+ ID 39) -- one bit of process-scoped entropy
@@ -26,12 +48,12 @@
 #     entropy source for the WEAK_ENTROPY_FALLBACK path. Also
 #     documented as WEAK_ENTROPY -- rdtsc-derived, not cryptographic.
 #
-# Both are ambient syscalls at v0.1.0 (no per-caller cap gate); the
-# capability contract on this file is therefore empty of MINTED
-# capabilities the consumer must grant. When a real CSPRNG capability
-# lands (KIND_CSPRNG, currently unfiled) this file grows a real
-# `requires:` line pointing at it and the TXID path swaps.
-requires: <none at v0.1.0 -- scaffold seed>
+# Every syscall named on this page is ambient (no per-caller cap
+# gate); the capability contract on this file is therefore empty of
+# MINTED capabilities the consumer must grant. When a real CSPRNG
+# capability lands (KIND_CSPRNG, currently unfiled) this file grows
+# a real `requires:` line pointing at it and the TXID path swaps.
+requires: <none at v0.3.0 -- every syscall consumed above is ambient>
 
 # --- Declared output schemas (semantic-pipe records libpdx-net emits
 #     via sys_semantic_send). --------------------------------------------

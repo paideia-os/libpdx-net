@@ -1,0 +1,509 @@
+// src/net_dns_parse.pdx -- libpdx-net.M2-006 (libpdx-net#9)
+//
+// DNS response parser: header/rcode/ancount + A/CNAME decode.
+//
+// =============================================================================
+// SCOPE (design/networking/r100-user-tools-plan.md §2.3 + RFC 1035 §4.1)
+// =============================================================================
+//
+// `net_dns_parse_response(pkt_ptr, pkt_len, out_addr_ptr, out_cname_ptr)
+// -> u64` reads a raw DNS response datagram (as produced by a server
+// answering the query net_dns_query.pdx builds) and:
+//
+//   - always returns the response's RCODE (bits [3:0] of the header's
+//     second flags byte, offset 3) in rax, 0..15, EXCEPT that a
+//     packet too short to contain a full 12-byte header returns
+//     0xFF -- a sentinel outside the 4-bit RCODE range so a caller
+//     can distinguish "the server said NXDOMAIN (rcode 3)" from
+//     "the packet was too malformed to even read a header".
+//   - if ANCOUNT > 0 and the first answer record is type A (1) class
+//     IN (1) with RDLENGTH == 4, copies its 4-byte RDATA (the IPv4
+//     address) to `out_addr_ptr`.
+//   - if the first answer record is type CNAME (5), decompresses its
+//     RDATA (a possibly-compressed domain name, RFC 1035 §4.1.4) into
+//     `out_cname_ptr` as a dot-joined, NUL-terminated ASCII string.
+//   - only the FIRST answer record is ever inspected, matching the
+//     issue's own scope ("If AN>0 and first answer is..."); a
+//     response with the requested record as answer #2+ (e.g. a
+//     CNAME chain of more than one hop) is out of scope for this
+//     landing and is filed as a future net_resolve-side CNAME-chain
+//     walk.
+//
+// Both output buffers are zeroed at function entry (4 zero bytes at
+// `out_addr_ptr`, a single NUL at `out_cname_ptr[0]`) BEFORE any
+// parsing happens, so a caller who unconditionally reads
+// `out_addr_ptr`/`out_cname_ptr` after the call always sees a
+// well-defined "absent" value (0.0.0.0 / empty string) rather than
+// stack or .bss garbage, regardless of which path this function
+// takes.
+//
+// -----------------------------------------------------------------------------
+// DNS name compression (RFC 1035 §4.1.4)
+// -----------------------------------------------------------------------------
+//
+// A name in the wire format is a sequence of labels (length-byte +
+// bytes) terminated either by a zero length byte (root) or by a
+// two-byte POINTER whose top two bits are both 1 (0xC0 mask): the
+// remaining 14 bits are a byte offset from the start of the message
+// where the name representation continues. A pointer, when present,
+// is always the LAST element of a name -- it can point at another
+// label sequence (which may itself end in a further pointer) but a
+// label sequence never resumes after a pointer.
+//
+// This file splits that into two reusable primitives:
+//
+//   net_dns_parse_skip_name(pkt_ptr, pkt_len, offset) -> u64
+//     Returns the offset immediately PAST the name representation
+//     starting at `offset`, WITHOUT following any pointer (a pointer
+//     is exactly 2 bytes wide regardless of where it points -- that
+//     is all a "skip past this name" caller needs). Used both to
+//     step over each question's QNAME (M1 -- QDCOUNT loop, only
+//     really exercised when QDCOUNT > 1, since this library's own
+//     net_dns_query.pdx always emits QDCOUNT=1) and to step over the
+//     first answer's own NAME field to reach its TYPE.
+//
+//   net_dns_parse_decode_name(pkt_ptr, pkt_len, start_offset, out_ptr) -> u64
+//     Fully decompresses a name, FOLLOWING pointers, into a
+//     dot-joined ASCII string at `out_ptr` (NUL-terminated). Used
+//     only for a CNAME answer's RDATA, which is the one place this
+//     library needs the actual decoded text of a possibly-compressed
+//     name rather than just its on-wire length. Guards against a
+//     pointer loop with a 32-hop cap and against RFC 1035's own
+//     255-byte total name-length cap.
+//
+// Both return the sentinel NETDP_OFFSET_ERR (0xFFFFFFFF -- far
+// outside any realistic packet offset or name length) on any
+// malformed input: truncated pointer, reserved length-form bits
+// (0x40/0x80) set, a label or pointer that would read past
+// `pkt_len`, a pointer loop exceeding the hop cap, or a decoded name
+// exceeding 255 bytes.
+//
+// -----------------------------------------------------------------------------
+// paideia-as compliance
+// -----------------------------------------------------------------------------
+//
+//   - Module name PascalCase basename (`NetDnsParse`) matches file.
+//   - Labels prefixed `netdp_` -- disjoint from every other label
+//     prefix in this repo.
+//   - No `test rN, rN` -- cmp/je/jne/jge/jg/jl only.
+//   - Base+index+displacement addressing (`[rbx + r14 + 1]`) is
+//     proven elsewhere in the tree (src/kernel/core/net/tcp_socket.pdx
+//     `mov rcx, [r13 + rax + 0]`, src/user/ime/bidi_uba.pdx
+//     `mov rax, [r10 + rcx + 0]`) -- used here for TYPE/CLASS/TTL/
+//     RDLENGTH/RDATA field reads relative to a fixed answer-record
+//     base.
+//   - `net_dns_parse_skip_name` and `net_dns_parse_decode_name` are
+//     both leaf (no nested `call`), so both use plain callee-save
+//     `push`/`pop` framing with NO alignment padding anywhere in
+//     their bodies (padding is only ever needed immediately before a
+//     `call`, and neither function issues one).
+//   - `net_dns_parse_response` DOES nest two `call
+//     net_dns_parse_skip_name` sites and one `call
+//     net_dns_parse_decode_name` site; each is preceded by `sub
+//     rsp,8` / followed by `add rsp,8` from its 6-push callee-save
+//     baseline (entry rsp%16==8, six pushes land rsp%16==8, pad ->
+//     0).
+//   - Every immediate is a small imm32 (0xFF, 0xC0, 0x3F, 0x0F, 12,
+//     32, 255, 0xFFFFFFFF fits imm32 unsigned range too) -- no
+//     MOVABS staging anywhere in this file.
+
+module NetDnsParse = structure {
+
+  // === Sentinels ==============================================================
+  pub let NETDP_OFFSET_ERR : u64 = 0xFFFFFFFF   // out-of-range offset / decode failure
+  pub let NETDP_RCODE_BAD_HEADER : u64 = 0xFF   // packet shorter than 12-byte header
+
+  // ============================================================================
+  // net_dns_parse_skip_name(pkt_ptr, pkt_len, offset) -> u64
+  // ============================================================================
+  //
+  // Returns the offset immediately past the name representation
+  // starting at `offset` (root byte consumed, or the 2-byte pointer
+  // consumed -- pointers are NOT followed). Returns
+  // NETDP_OFFSET_ERR on any malformed/out-of-bounds input.
+  //
+  // Leaf -- no nested call, no push/pop, no alignment padding.
+  // rdi=pkt_ptr, rsi=pkt_len, rdx=offset (mutated in place as the
+  // scan advances); rax/r8/r9/r10/r11 are scratch.
+  // ============================================================================
+  pub let net_dns_parse_skip_name : (u64, u64, u64) -> u64 !{mem} @{} =
+    fn (pkt_ptr: u64, pkt_len: u64, offset: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "libpdx-net.M2-006 (#9): measure-only name skip (does not follow compression pointers -- a pointer is always exactly 2 bytes on the wire regardless of its target, which is all a skip-past-this-name caller needs). Loop over rdx (offset, mutated): bound-check rdx<rsi; load the length/type byte at [rdi+rdx]; if its top two bits are 11 (r9 = byte & 0xC0 == 0xC0) it is a pointer -- bound-check one more byte is available, return offset+2. If the byte is exactly 0 it is the root terminator -- return offset+1. Otherwise it is an ordinary label length: reject reserved forms (byte > 0x3F, i.e. the 0x40/0x80 length-bit patterns RFC 1035 never defines), bound-check offset+1+len<=pkt_len, advance offset by 1+len and loop. Every branch that would read or imply reading past pkt_len returns NETDP_OFFSET_ERR (0xFFFFFFFF) instead. Leaf -- no nested call, so no push/pop and no stack padding; every register used (rax/r8/r9/r10/r11) is caller-save scratch. No `test rN,rN`. Labels prefixed netdp_skip_.",
+      block: {
+      netdp_skip_loop:
+        cmp rdx, rsi;
+        jge netdp_skip_fail;
+
+        xor r8, r8;
+        mov_b r8, [rdi + rdx];            // r8 = pkt[offset]
+
+        mov r9, r8;
+        and r9, 0xC0;
+        cmp r9, 0xC0;
+        je  netdp_skip_ptr;
+
+        cmp r8, 0;
+        je  netdp_skip_root;
+
+        cmp r8, 0x3F;
+        jg  netdp_skip_fail;              // reserved length-form bits set
+
+        mov r11, rdx;
+        add r11, 1;
+        add r11, r8;
+        cmp r11, rsi;
+        jg  netdp_skip_fail;
+
+        mov rdx, r11;
+        jmp netdp_skip_loop;
+
+      netdp_skip_ptr:
+        mov r10, rdx;
+        add r10, 1;
+        cmp r10, rsi;
+        jge netdp_skip_fail;
+        mov rax, rdx;
+        add rax, 2;
+        ret;
+
+      netdp_skip_root:
+        mov rax, rdx;
+        add rax, 1;
+        ret;
+
+      netdp_skip_fail:
+        mov rax, 0xFFFFFFFF;              // NETDP_OFFSET_ERR
+        ret
+      }
+    }
+
+  // ============================================================================
+  // net_dns_parse_decode_name(pkt_ptr, pkt_len, start_offset, out_ptr) -> u64
+  // ============================================================================
+  //
+  // Fully decompresses a name (following pointers) into a
+  // dot-joined, NUL-terminated ASCII string at out_ptr. Returns the
+  // written length (excluding the NUL) on success, or
+  // NETDP_OFFSET_ERR on malformed input / a pointer loop exceeding
+  // 32 hops / a decoded name exceeding 255 bytes.
+  //
+  // Leaf -- no nested call. 6-push callee-save prologue holds every
+  // value that must survive the whole scan (pkt_ptr, pkt_len,
+  // out_ptr, cur, written, hops); no alignment padding is needed
+  // anywhere since this function never issues a `call`.
+  // ============================================================================
+  pub let net_dns_parse_decode_name : (u64, u64, u64, u64) -> u64 !{mem} @{} =
+    fn (pkt_ptr: u64, pkt_len: u64, start_offset: u64, out_ptr: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "libpdx-net.M2-006 (#9): full name decompression, following compression pointers. 6-push callee-save prologue: rbx=pkt_ptr, rbp=pkt_len, r12=out_ptr, r13=cur (offset cursor, init from start_offset), r14=written (output byte count, init 0), r15=hops (pointer-follow count, init 0; capped at 32 to refuse a pointer cycle). No nested `call` anywhere in this function, so no alignment padding is needed despite the 6 pushes -- padding only matters immediately before a `call`. `written==0` doubles as the 'is this the first label' test (no separate flag register needed): a non-first label gets a '.' separator byte written before its own bytes. Loop body per iteration: load pkt[cur]; top-two-bits==11 -> pointer (decode the 14-bit target from this byte's low 6 bits + the next byte, bump+bound-check hops, cur=target, continue); ==0 -> root (write terminating NUL, return `written`); otherwise an ordinary label: reject reserved length-form bits (>0x3F), bound-check the label's bytes fit in the packet, bound-check written+label_len+dot<=255 (RFC 1035's own name-length cap), write the separator if not first, copy the label bytes via [rbx+rcx] source / [r12+r14] dest addressing (rcx recomputed once per label as rbx-relative source base so the inner copy needs only two-register addressing), advance cur past the label, loop. Any bound violation returns NETDP_OFFSET_ERR (0xFFFFFFFF). No `test rN,rN`. Labels prefixed netdp_dec_.",
+      block: {
+        push rbx;
+        push rbp;
+        push r12;
+        push r13;
+        push r14;
+        push r15;
+
+        mov rbx, rdi;                     // pkt_ptr
+        mov rbp, rsi;                     // pkt_len
+        mov r12, rcx;                     // out_ptr
+        mov r13, rdx;                     // cur = start_offset
+        xor r14, r14;                     // written = 0
+        xor r15, r15;                     // hops = 0
+
+      netdp_dec_loop:
+        cmp r13, rbp;
+        jge netdp_dec_fail;
+
+        xor rax, rax;
+        mov_b rax, [rbx + r13];           // rax = pkt[cur]
+
+        mov rcx, rax;
+        and rcx, 0xC0;
+        cmp rcx, 0xC0;
+        je  netdp_dec_ptr;
+
+        cmp rax, 0;
+        je  netdp_dec_done;
+
+        cmp rax, 0x3F;
+        jg  netdp_dec_fail;               // reserved length-form bits set
+
+        mov rcx, r13;
+        add rcx, 1;
+        add rcx, rax;
+        cmp rcx, rbp;
+        jg  netdp_dec_fail;               // label bytes run past packet end
+
+        mov rcx, rax;                     // rcx = label_len + (dot ? 1 : 0)
+        cmp r14, 0;
+        je  netdp_dec_no_dot;
+        add rcx, 1;
+      netdp_dec_no_dot:
+        add rcx, r14;
+        cmp rcx, 255;
+        jg  netdp_dec_fail;               // decoded name too long (RFC 1035 cap)
+
+        cmp r14, 0;
+        je  netdp_dec_write_label;
+        mov_b [r12 + r14], 0x2E;          // '.'
+        add r14, 1;
+      netdp_dec_write_label:
+        mov rcx, r13;
+        add rcx, 1;                       // rcx = source base = cur + 1
+
+        xor rdx, rdx;                     // j = 0
+      netdp_dec_copy:
+        cmp rdx, rax;
+        jge netdp_dec_copy_done;
+        xor r8, r8;
+        mov_b r8, [rbx + rcx];
+        mov_b [r12 + r14], r8;
+        add rcx, 1;
+        add r14, 1;
+        add rdx, 1;
+        jmp netdp_dec_copy;
+
+      netdp_dec_copy_done:
+        add r13, 1;
+        add r13, rax;                     // cur = cur + 1 + label_len
+        jmp netdp_dec_loop;
+
+      netdp_dec_ptr:
+        mov rcx, r13;
+        add rcx, 1;
+        cmp rcx, rbp;
+        jge netdp_dec_fail;               // truncated pointer
+        xor rdx, rdx;
+        mov_b rdx, [rbx + rcx];           // pointer low byte
+        mov rcx, rax;
+        and rcx, 0x3F;                    // pointer offset high 6 bits
+        shl rcx, 8;
+        or  rcx, rdx;                     // rcx = target offset
+
+        cmp r15, 32;
+        jge netdp_dec_fail;               // pointer-hop cap (loop guard)
+        add r15, 1;
+
+        mov r13, rcx;                     // cur = target offset
+        jmp netdp_dec_loop;
+
+      netdp_dec_done:
+        mov_b [r12 + r14], 0x00;          // NUL terminator
+        mov rax, r14;                     // return written length (excl. NUL)
+
+        pop r15;
+        pop r14;
+        pop r13;
+        pop r12;
+        pop rbp;
+        pop rbx;
+        ret;
+
+      netdp_dec_fail:
+        mov rax, 0xFFFFFFFF;              // NETDP_OFFSET_ERR
+
+        pop r15;
+        pop r14;
+        pop r13;
+        pop r12;
+        pop rbp;
+        pop rbx;
+        ret
+      }
+    }
+
+  // ============================================================================
+  // net_dns_parse_response(pkt_ptr, pkt_len, out_addr_ptr, out_cname_ptr) -> u64
+  // ============================================================================
+  //
+  // See file header for the full contract. 6-push callee-save
+  // prologue: rbx=pkt_ptr, rbp=pkt_len, r12=out_addr_ptr,
+  // r13=out_cname_ptr, r14=cur (running offset), r15=QDCOUNT
+  // (decremented while skipping questions).
+  // ============================================================================
+  pub let net_dns_parse_response : (u64, u64, u64, u64) -> u64 !{mem} @{} =
+    fn (pkt_ptr: u64, pkt_len: u64, out_addr_ptr: u64, out_cname_ptr: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "libpdx-net.M2-006 (#9): DNS response parser entry point. 6-push callee-save prologue (rbx=pkt_ptr, rbp=pkt_len, r12=out_addr_ptr, r13=out_cname_ptr, r14=cur, r15=QDCOUNT) + `sub rsp,8`/`add rsp,8` bracketing each of the three nested calls (two to net_dns_parse_skip_name, one to net_dns_parse_decode_name): entry rsp%16==8, six pushes land rsp%16==8, pad -> 0 for each call site. Phase 0: zero both outputs (4 bytes at out_addr_ptr, 1 NUL byte at out_cname_ptr) before any parsing, so both are always well-defined on every return path. Phase 1: refuse pkt_len<12 -> return NETDP_RCODE_BAD_HEADER (0xFF, outside the 4-bit RCODE range) before reading any header field. Phase 2: read QDCOUNT (BE u16 @ offset 4) into r15 and ANCOUNT (BE u16 @ offset 6); ANCOUNT==0 short-circuits straight to the rcode-and-return tail (the issue's own contract only ever inspects an answer when AN>0). Phase 3: while r15>0, call net_dns_parse_skip_name(pkt_ptr, pkt_len, cur) to step over each question's QNAME, +4 more for its QTYPE/QCLASS, decrementing r15; cur starts at 12. Phase 4: call net_dns_parse_skip_name once more over the first answer's own NAME field to reach its TYPE; bound-check 10 more bytes (TYPE 2 + CLASS 2 + TTL 4 + RDLENGTH 2) are present. Phase 5: read TYPE/CLASS/RDLENGTH as BE u16 via `[rbx+r14+N]` base+index+disp addressing (proven elsewhere: tcp_socket.pdx / bidi_uba.pdx); bound-check RDATA (cur+10 .. cur+10+RDLENGTH) fits in the packet. Phase 6a: TYPE==1 (A) AND CLASS==1 (IN) AND RDLENGTH==4 -> copy the 4 RDATA bytes to out_addr_ptr via per-byte `mov_b` loads/stores at fixed +0..+3 offsets from the RDATA base. Phase 6b: TYPE==5 (CNAME) -> call net_dns_parse_decode_name(pkt_ptr, pkt_len, cur+10, out_cname_ptr); on failure (NETDP_OFFSET_ERR) force out_cname_ptr back to an empty string rather than leaving a partially-written name. Any other TYPE/CLASS combination leaves both outputs at their Phase-0 zeroed state. Phase 7 (all paths converge here): re-read the RCODE nibble at pkt[3] fresh (rbx/rbp are untouched by every prior phase, so this is always safe) and return it in rax -- computing rcode once at the very end rather than threading it through every phase avoids needing a seventh callee-save slot. No `test rN,rN`. Labels prefixed netdp_resp_.",
+      block: {
+        push rbx;
+        push rbp;
+        push r12;
+        push r13;
+        push r14;
+        push r15;
+
+        mov rbx, rdi;                     // pkt_ptr
+        mov rbp, rsi;                     // pkt_len
+        mov r12, rdx;                     // out_addr_ptr
+        mov r13, rcx;                     // out_cname_ptr
+
+        mov_b [r12 + 0], 0;
+        mov_b [r12 + 1], 0;
+        mov_b [r12 + 2], 0;
+        mov_b [r12 + 3], 0;
+        mov_b [r13 + 0], 0;
+
+        cmp rbp, 12;
+        jl  netdp_resp_fail_hdr;
+
+        // QDCOUNT (BE u16 @ offset 4)
+        xor rax, rax;
+        mov_b rax, [rbx + 4];
+        shl rax, 8;
+        xor rdx, rdx;
+        mov_b rdx, [rbx + 5];
+        or  rax, rdx;
+        mov r15, rax;                     // r15 = QDCOUNT
+
+        // ANCOUNT (BE u16 @ offset 6)
+        xor rax, rax;
+        mov_b rax, [rbx + 6];
+        shl rax, 8;
+        xor rdx, rdx;
+        mov_b rdx, [rbx + 7];
+        or  rax, rdx;
+        cmp rax, 0;
+        je  netdp_resp_done_rcode;        // no answers -> just return rcode
+
+        mov r14, 12;                      // cur = start of question section
+      netdp_resp_qskip_loop:
+        cmp r15, 0;
+        jle netdp_resp_qskip_done;
+
+        mov rdi, rbx;
+        mov rsi, rbp;
+        mov rdx, r14;
+        sub rsp, 8;
+        call net_dns_parse_skip_name;
+        add rsp, 8;
+
+        mov r11, 0xFFFFFFFF; cmp rax, r11;
+        je  netdp_resp_fail_hdr;
+        add rax, 4;                       // + QTYPE + QCLASS
+        cmp rax, rbp;
+        jg  netdp_resp_fail_hdr;
+        mov r14, rax;
+        sub r15, 1;
+        jmp netdp_resp_qskip_loop;
+
+      netdp_resp_qskip_done:
+        mov rdi, rbx;
+        mov rsi, rbp;
+        mov rdx, r14;
+        sub rsp, 8;
+        call net_dns_parse_skip_name;
+        add rsp, 8;
+
+        mov r11, 0xFFFFFFFF; cmp rax, r11;
+        je  netdp_resp_fail_hdr;
+        mov r14, rax;                     // cur = offset of answer's TYPE
+
+        mov rax, r14;
+        add rax, 10;
+        cmp rax, rbp;
+        jg  netdp_resp_fail_hdr;
+
+        // TYPE (BE u16)
+        xor rax, rax;
+        mov_b rax, [rbx + r14 + 0];
+        shl rax, 8;
+        xor rdx, rdx;
+        mov_b rdx, [rbx + r14 + 1];
+        or  rax, rdx;
+        mov r10, rax;                     // r10 = TYPE
+
+        // CLASS (BE u16)
+        xor rax, rax;
+        mov_b rax, [rbx + r14 + 2];
+        shl rax, 8;
+        xor rdx, rdx;
+        mov_b rdx, [rbx + r14 + 3];
+        or  rax, rdx;
+        mov r9, rax;                      // r9 = CLASS
+
+        // RDLENGTH (BE u16)
+        xor rax, rax;
+        mov_b rax, [rbx + r14 + 8];
+        shl rax, 8;
+        xor rdx, rdx;
+        mov_b rdx, [rbx + r14 + 9];
+        or  rax, rdx;
+        mov r8, rax;                      // r8 = RDLENGTH
+
+        mov rax, r14;
+        add rax, 10;
+        add rax, r8;
+        cmp rax, rbp;
+        jg  netdp_resp_fail_hdr;          // RDATA runs past packet end
+
+        cmp r10, 1;                       // TYPE_A
+        jne netdp_resp_check_cname;
+        cmp r9, 1;                        // CLASS_IN
+        jne netdp_resp_done_rcode;
+        cmp r8, 4;
+        jne netdp_resp_done_rcode;
+
+        mov rax, r14;
+        add rax, 10;                      // rax = RDATA offset
+        xor rdx, rdx;
+        mov_b rdx, [rbx + rax + 0];
+        mov_b [r12 + 0], rdx;
+        xor rdx, rdx;
+        mov_b rdx, [rbx + rax + 1];
+        mov_b [r12 + 1], rdx;
+        xor rdx, rdx;
+        mov_b rdx, [rbx + rax + 2];
+        mov_b [r12 + 2], rdx;
+        xor rdx, rdx;
+        mov_b rdx, [rbx + rax + 3];
+        mov_b [r12 + 3], rdx;
+        jmp netdp_resp_done_rcode;
+
+      netdp_resp_check_cname:
+        cmp r10, 5;                       // TYPE_CNAME
+        jne netdp_resp_done_rcode;
+
+        mov rdi, rbx;
+        mov rsi, rbp;
+        mov rdx, r14;
+        add rdx, 10;                      // start_offset = RDATA position
+        mov rcx, r13;                     // out_ptr = out_cname_ptr
+        sub rsp, 8;
+        call net_dns_parse_decode_name;
+        add rsp, 8;
+
+        mov r11, 0xFFFFFFFF; cmp rax, r11;
+        jne netdp_resp_done_rcode;
+        mov_b [r13 + 0], 0;               // decode failed -> force empty string
+        jmp netdp_resp_done_rcode;
+
+      netdp_resp_done_rcode:
+        xor rax, rax;
+        mov_b rax, [rbx + 3];
+        and rax, 0x0F;
+
+        pop r15;
+        pop r14;
+        pop r13;
+        pop r12;
+        pop rbp;
+        pop rbx;
+        ret;
+
+      netdp_resp_fail_hdr:
+        mov rax, 0xFF;                    // NETDP_RCODE_BAD_HEADER
+
+        pop r15;
+        pop r14;
+        pop r13;
+        pop r12;
+        pop rbp;
+        pop rbx;
+        ret
+      }
+    }
+
+}
