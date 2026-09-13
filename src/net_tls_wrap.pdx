@@ -1,0 +1,262 @@
+// src/net_tls_wrap.pdx -- libpdx-net.M3-001 (libpdx-net#11)
+//
+// TLS 1.3 ClientHello -- scaffold-only, R100-PREP blocked.
+//
+// =============================================================================
+// SCOPE (design/networking/r100-user-tools-plan.md §2.4 + §12.4)
+// =============================================================================
+//
+// `net_tls_wrap(sock_fd, trust_cap, hostname_ptr, hostname_len) -> u64`
+// composes a fixed-size, 158-byte TLS 1.3 ClientHello (RFC 8446
+// §4.1.2) and emits it over an already-connected socket via
+// `NetTcp::net_tcp_send`. This is a SCAFFOLD landing: it does not
+// wait for or parse a ServerHello, does not derive any key material
+// (that is net_tls_key_schedule.pdx's job, itself also
+// scaffold-only), and does not verify anything against `trust_cap`
+// (accepted but unused -- see below). The real end-to-end handshake
+// (M3-002..M3-004, issues #12/#13/#14) is blocked on R100-PREP-005
+// (paideia-as SHA-256/HKDF/X25519/Ed25519 crypto intrinsics -- §12.4);
+// this function's job is only to prove the wire bytes are correct and
+// to give the real handshake body a stable call site to grow into,
+// the same "ships anyway, named as a known gap" posture §2.3 already
+// prescribes for net_resolve_udp.pdx.
+//
+// `trust_cap` is accepted (part of the issue's own four-argument
+// contract, and the eventual real body's server-key-selection input
+// per §0.5's pinned-key trust model) but UNUSED at this scaffold
+// landing -- there is no certificate/signature verification here at
+// all yet (that lands with M3-003, #13, itself blocked on the same
+// R100-PREP-005 Ed25519 gap). Its register is simply never read.
+//
+// -----------------------------------------------------------------------------
+// Fixed 158-byte template layout
+// -----------------------------------------------------------------------------
+//
+// A real ClientHello's total length varies with the SNI hostname's
+// length. This scaffold instead fixes EVERY size in the template at
+// compose time, including a 32-byte SNI hostname SLOT (truncated if
+// `hostname_len` > 32, zero-padded if shorter) -- the arithmetic below
+// is what pins the total at exactly 158 bytes:
+//
+//   TLS record header ................................  5   (+0..4)
+//   Handshake header ..................................  4   (+5..8)
+//   client_version .....................................2   (+9..10)
+//   random (WEAK: zero-filled, see below) ............. 32   (+11..42)
+//   session_id_length (0 -- no resumption) ..............1  (+43)
+//   cipher_suites: length(2) + TLS_AES_128_GCM_SHA256(2)  4  (+44..47)
+//   compression_methods: length(1) + null(1) .............2 (+48..49)
+//   extensions_total_length (u16 BE) .....................2 (+50..51)
+//   ext server_name:     4 hdr + 5 fixed + 32 hostname .. 41 (+52..92)
+//   ext supported_groups (x25519 only) ....................8 (+93..100)
+//   ext signature_algorithms (ed25519 only) ...............8 (+101..108)
+//   ext key_share (x25519, WEAK zero placeholder key) .... 42 (+109..150)
+//   ext supported_versions (TLS 1.3 = 0x0304 only) .........7 (+151..157)
+//   ---------------------------------------------------------------
+//   total ................................................158 bytes
+//
+// Every length field above (record length=153, handshake length=149,
+// extensions_total_length=106, each per-extension length) is
+// therefore a FIXED compile-time constant, not something this
+// function computes at runtime -- the only two runtime-dependent
+// writes are the hostname bytes themselves and how many of the 32
+// SNI-slot bytes actually came from the caller (the remainder stays
+// zero from the initial memset, which for a truncated real hostname
+// means the ClientHello's SNI value is silently wrong past 32 bytes
+// -- an accepted scaffold limitation, not a security-relevant one,
+// since nothing downstream of this scaffold's own emit path consumes
+// or trusts the byte).
+//
+// WEAK fields (documented, both zero-filled by the same initial
+// memset rather than a dedicated write): the 32-byte `random` field
+// (a real ClientHello needs cryptographically random bytes here; no
+// CSPRNG primitive is wired to this file, same WEAK_ENTROPY_FALLBACK
+// gap net_dns_txid.pdx's own header documents) and the 32-byte X25519
+// public key inside the `key_share` extension (a real body would call
+// paideia-as's landed X25519 intrinsic (library-status.md: landed
+// v0.27.0) to generate an actual keypair and place its public half
+// here -- wiring that keygen call is left to the real M3-001 follow-up
+// once R100-PREP-005's OTHER gates (SHA-256/HKDF/Ed25519, needed for
+// the surrounding handshake to go anywhere even with a real key
+// share) are also closed, so a half-real ClientHello is not worth the
+// extra call site today).
+//
+// =============================================================================
+// paideia-as compliance
+// =============================================================================
+//
+//   - Module name PascalCase basename (`NetTlsWrap`) matches file.
+//   - Labels prefixed `tlsw_` -- disjoint from every other label
+//     prefix in this repo (net_tls_record.pdx already uses
+//     `libpdxnet_tlsr_`), avoids reserved keywords.
+//   - No `test rN, rN` -- cmp/jle/jge/je only.
+//   - Byte loads go through the xor-then-mov_b idiom (#1248
+//     workaround); byte stores use `mov_b [mem], imm` (zero-fill loop)
+//     and `mov_b [base + index + disp], reg` (hostname copy) -- the
+//     same base+index+disp shape net_dns_parse.pdx's own header cites
+//     as proven elsewhere in the tree.
+//   - Exactly four curried args (sock_fd, trust_cap, hostname_ptr,
+//     hostname_len) -- at, not over, the paideia-as ceiling.
+//   - One nested `call net_tcp_send` -- 1-push callee-save prologue
+//     (rbx=sock_fd): entry rsp%16==8, one push lands rsp%16==0
+//     directly, so the call needs no further pad (the same
+//     already-aligned-after-one-push shape sys_listen.pdx and this
+//     wave's own net_api.pdx net_bind adapter both document).
+//   - Every immediate here is a small imm32 (largest is 158) -- no
+//     MOVABS staging anywhere in this file.
+
+module NetTlsWrap = structure {
+
+  pub let NTW_OK           : u64 = 0x00   // == NetTypes.TLS_OK's low
+                                           // byte shape at this
+                                           // scaffold landing -- the
+                                           // real body will widen this
+                                           // to the full TLS_OK (0x20)
+                                           // once a real send-success
+                                           // path exists to distinguish
+                                           // from a plain 0.
+  pub let NTW_CLIENT_HELLO_BYTES : u64 = 158
+  pub let NTW_HOSTNAME_SLOT_BYTES : u64 = 32
+  pub let NTW_HOSTNAME_SLOT_OFFSET : u64 = 61
+
+  // === Module-private scratch (single-threaded per §0.3) ====================
+  pub let mut _ntw_client_hello_scratch : [u8; 158] = uninit @align(8)
+
+  // ==========================================================================
+  // net_tls_wrap(sock_fd, trust_cap, hostname_ptr, hostname_len) -> u64
+  // ==========================================================================
+  //
+  // See file header for the full 158-byte template layout.
+  // ==========================================================================
+  pub let net_tls_wrap : (u64, u64, u64, u64) -> u64 !{sysreg, mem} @{} =
+    fn (sock_fd: u64, trust_cap: u64, hostname_ptr: u64, hostname_len: u64) -> unsafe {
+      effects: {sysreg, mem}, capabilities: {},
+      justification: "libpdx-net.M3-001 (#11): scaffold-only TLS 1.3 ClientHello compose + emit, R100-PREP-005 blocked (see file header). 1-push callee-save prologue (rbx=sock_fd; rsi=trust_cap deliberately never read -- unused at this scaffold landing) lands rsp%16==0 directly (entry rsp%16==8), so the one nested `call net_tcp_send` needs no further pad. r14 holds &_ntw_client_hello_scratch for the whole function. Phase 1: zero-fill all 158 bytes via a `cmp rax,158; jge done; mov_b [r14+rax],0; add rax,1; jmp loop` scan -- this single loop is what leaves the `random` field (+11..42) and the key_share placeholder key (+119..150) at their documented WEAK zero value with no dedicated write. Phase 2: patch every FIXED byte of the template (record/handshake headers, client_version, session_id_length, cipher_suite, compression, extensions_total_length, and every extension's type/length/fixed-value fields) via `mov_b [r14+N], imm` immediate stores at the exact offsets the file header's byte-budget table derives -- every one of these is a compile-time constant because the 32-byte SNI slot is ALSO fixed-size, so no extension length depends on the runtime hostname_len. Phase 3: hostname copy -- rdx still holds hostname_ptr untouched (never overwritten by phase 1/2, which only ever address via r14), rcx holds hostname_len; clamp r8=min(hostname_len,32) via `cmp r8,32; jle ok; mov r8,32`, then a byte-copy loop (r9=index, xor-then-mov_b load from [rdx+r9], `mov_b [r14+r9+61], r10` store -- base+index+disp addressing) copies up to 32 bytes into the SNI slot; the memset from phase 1 already left any remaining slot bytes at zero (correct zero-padding for a short hostname; documented truncation for an over-32-byte one). Phase 4: `call net_tcp_send(sock_fd=rbx, buf=r14, len=158)` -- WEAK: this scaffold does not check the send's return value (a short write is unrecoverable at this landing anyway, since there is no ServerHello wait/retry loop yet) and does not wait for or parse anything the peer sends back. Returns NTW_OK (0) unconditionally on this path. No `test rN,rN`. Labels prefixed tlsw_.",
+      block: {
+        push rbx;
+        mov rbx, rdi;                    // sock_fd
+
+        lea r14, [rip + _ntw_client_hello_scratch];
+
+        // --- Phase 1: zero-fill all 158 bytes ---
+        xor rax, rax;
+      tlsw_zero_loop:
+        cmp rax, 158;
+        jge tlsw_zero_done;
+        mov_b [r14 + rax], 0;
+        add rax, 1;
+        jmp tlsw_zero_loop;
+      tlsw_zero_done:
+
+        // --- Phase 2: fixed template bytes ---
+        mov_b [r14 + 0], 0x16;           // record: ContentType = handshake
+        mov_b [r14 + 1], 0x03;           // record: legacy_version major
+        mov_b [r14 + 2], 0x01;           // record: legacy_version minor
+        mov_b [r14 + 3], 0x00;           // record: length hi
+        mov_b [r14 + 4], 0x99;           // record: length lo (153)
+
+        mov_b [r14 + 5], 0x01;           // handshake: type = client_hello
+        mov_b [r14 + 6], 0x00;           // handshake: length[0] (u24 hi)
+        mov_b [r14 + 7], 0x00;           // handshake: length[1]
+        mov_b [r14 + 8], 0x95;           // handshake: length[2] lo (149)
+
+        mov_b [r14 + 9], 0x03;           // client_version major
+        mov_b [r14 + 10], 0x03;          // client_version minor
+        // +11..42 random -- left zero (WEAK, see file header)
+
+        mov_b [r14 + 43], 0x00;          // session_id_length = 0
+
+        mov_b [r14 + 44], 0x00;          // cipher_suites_length hi
+        mov_b [r14 + 45], 0x02;          // cipher_suites_length lo (2)
+        mov_b [r14 + 46], 0x13;          // TLS_AES_128_GCM_SHA256 hi
+        mov_b [r14 + 47], 0x01;          // TLS_AES_128_GCM_SHA256 lo
+
+        mov_b [r14 + 48], 0x01;          // compression_methods_length = 1
+        mov_b [r14 + 49], 0x00;          // compression_method = null
+
+        mov_b [r14 + 50], 0x00;          // extensions_total_length hi
+        mov_b [r14 + 51], 0x6A;          // extensions_total_length lo (106)
+
+        // --- ext server_name @52 ---
+        mov_b [r14 + 52], 0x00;          // ext type hi (server_name=0x0000)
+        mov_b [r14 + 53], 0x00;          // ext type lo
+        mov_b [r14 + 54], 0x00;          // ext_data_length hi
+        mov_b [r14 + 55], 0x25;          // ext_data_length lo (37)
+        mov_b [r14 + 56], 0x00;          // server_name_list_length hi
+        mov_b [r14 + 57], 0x23;          // server_name_list_length lo (35)
+        mov_b [r14 + 58], 0x00;          // name_type = host_name
+        mov_b [r14 + 59], 0x00;          // name_length hi
+        mov_b [r14 + 60], 0x20;          // name_length lo (32)
+        // +61..92 hostname slot (Phase 3)
+
+        // --- ext supported_groups @93 (x25519 only) ---
+        mov_b [r14 + 93], 0x00;          // ext type hi (0x000A)
+        mov_b [r14 + 94], 0x0A;          // ext type lo
+        mov_b [r14 + 95], 0x00;          // ext_data_length hi
+        mov_b [r14 + 96], 0x04;          // ext_data_length lo (4)
+        mov_b [r14 + 97], 0x00;          // named_group_list_length hi
+        mov_b [r14 + 98], 0x02;          // named_group_list_length lo (2)
+        mov_b [r14 + 99], 0x00;          // x25519 hi
+        mov_b [r14 + 100], 0x1D;         // x25519 lo (0x001D)
+
+        // --- ext signature_algorithms @101 (ed25519 only) ---
+        mov_b [r14 + 101], 0x00;         // ext type hi (0x000D)
+        mov_b [r14 + 102], 0x0D;         // ext type lo
+        mov_b [r14 + 103], 0x00;         // ext_data_length hi
+        mov_b [r14 + 104], 0x04;         // ext_data_length lo (4)
+        mov_b [r14 + 105], 0x00;         // sig_algs_list_length hi
+        mov_b [r14 + 106], 0x02;         // sig_algs_list_length lo (2)
+        mov_b [r14 + 107], 0x08;         // ed25519 hi
+        mov_b [r14 + 108], 0x07;         // ed25519 lo (0x0807)
+
+        // --- ext key_share @109 (x25519 only, WEAK zero key) ---
+        mov_b [r14 + 109], 0x00;         // ext type hi (0x0033)
+        mov_b [r14 + 110], 0x33;         // ext type lo
+        mov_b [r14 + 111], 0x00;         // ext_data_length hi
+        mov_b [r14 + 112], 0x26;         // ext_data_length lo (38)
+        mov_b [r14 + 113], 0x00;         // client_shares_length hi
+        mov_b [r14 + 114], 0x22;         // client_shares_length lo (34)
+        mov_b [r14 + 115], 0x00;         // group hi (x25519)
+        mov_b [r14 + 116], 0x1D;         // group lo
+        mov_b [r14 + 117], 0x00;         // key_exchange_length hi
+        mov_b [r14 + 118], 0x20;         // key_exchange_length lo (32)
+        // +119..150 x25519 public key placeholder -- left zero (WEAK)
+
+        // --- ext supported_versions @151 (TLS 1.3 only) ---
+        mov_b [r14 + 151], 0x00;         // ext type hi (0x002B)
+        mov_b [r14 + 152], 0x2B;         // ext type lo
+        mov_b [r14 + 153], 0x00;         // ext_data_length hi
+        mov_b [r14 + 154], 0x03;         // ext_data_length lo (3)
+        mov_b [r14 + 155], 0x02;         // supported_versions list length
+        mov_b [r14 + 156], 0x03;         // TLS 1.3 hi (0x0304)
+        mov_b [r14 + 157], 0x04;         // TLS 1.3 lo
+
+        // --- Phase 3: hostname copy, clamped to the 32-byte SNI slot ---
+        mov r8, rcx;                     // hostname_len
+        cmp r8, 32;
+        jle tlsw_hostlen_ok;
+        mov r8, 32;
+      tlsw_hostlen_ok:
+        xor r9, r9;
+      tlsw_host_copy:
+        cmp r9, r8;
+        jge tlsw_host_copy_done;
+        xor r10, r10;
+        mov_b r10, [rdx + r9];
+        mov_b [r14 + r9 + 61], r10;
+        add r9, 1;
+        jmp tlsw_host_copy;
+      tlsw_host_copy_done:
+
+        // --- Phase 4: emit ---
+        mov rdi, rbx;
+        mov rsi, r14;
+        mov rdx, 158;
+        call net_tcp_send;
+
+        xor rax, rax;                    // NTW_OK -- WEAK, no ServerHello wait
+        pop rbx;
+        ret
+      }
+    }
+
+}

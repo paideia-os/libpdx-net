@@ -1,0 +1,419 @@
+// src/net_resolve_udp.pdx -- libpdx-net.M2-007 (libpdx-net#10)
+//
+// net_resolve_udp: UDP transport for the DNS resolver -- wires the
+// already-landed query builder (net_dns_query.pdx, M2-005 #8) and
+// response parser (net_dns_parse.pdx, M2-006 #9) over a real
+// connected-UDP socket using net_tcp.pdx's raw syscall trampolines
+// (M2-001 #4; those five trampolines are transport-agnostic --
+// paideia-os's kernel dispatches send/recv/connect/close on the fd's
+// OWN cap kind, so a KIND_UDP_SOCKET fd rides the exact same
+// `net_tcp_socket`/`net_tcp_connect`/`net_tcp_send`/`net_tcp_recv`/
+// `net_tcp_close` trampolines a TCP fd does -- confirmed live by
+// `tools/user/pdxsock/src/main.pdx`'s v1.3.0 UDP client, which calls
+// this "connected-UDP -- no handshake, kernel-side just latches the
+// default peer" and reuses sys_send/sys_recv/sys_shutdown byte-
+// identically).
+//
+// =============================================================================
+// SCOPE (design/networking/r100-user-tools-plan.md §2.3 + §2.3.1)
+// =============================================================================
+//
+// `net_resolve_udp(host_ptr, host_len, qtype, out_addr_ptr) -> u64`:
+//
+//   1. Builds a DNS query via NetDnsQuery::net_dns_build_query.
+//   2. Opens a SOCK_DGRAM=2 socket (AF_INET=2, proto=0) via
+//      NetTcp::net_tcp_socket.
+//   3. Connects it to the configured resolver's IP:53 via
+//      NetTcp::net_tcp_connect.
+//   4. Best-effort, floor-only attempts a 3-second receive timeout via
+//      a raw sys_setsockopt (SC+99) call -- see "WEAK_TIMEOUT_FLOOR"
+//      below; this is a documented no-op against the live kernel.
+//   5. Sends the query via NetTcp::net_tcp_send.
+//   6. Receives one datagram via NetTcp::net_tcp_recv. A same-call
+//      zero-byte return (the UDP recv path already returns 0 on an
+//      empty ring rather than blocking, per
+//      src/kernel/core/syscall/handlers/sys_setsockopt.pdx's own
+//      header) is treated as DNS_ERR_TIMEOUT.
+//   7. Closes the socket.
+//   8. Parses the response via NetDnsParse::net_dns_parse_response.
+//   9. Verifies the response's transaction ID against the one baked
+//      into the query buffer via NetDnsTxid::net_dns_txid_verify
+//      BEFORE trusting anything the parse step wrote to
+//      `out_addr_ptr` -- per §2.3.1 this check is mandatory, not
+//      optional, even at v1.
+//  10. Maps the verified response's RCODE onto the NetTypes.DnsErr
+//      band (NOERROR->DNS_OK, NXDOMAIN->DNS_ERR_NXDOMAIN,
+//      SERVFAIL->DNS_ERR_SERVFAIL, REFUSED->DNS_ERR_REFUSED, anything
+//      else->DNS_ERR_MALFORMED) and returns it.
+//
+// `out_addr_ptr` (4 bytes) is zeroed at function ENTRY, before any of
+// the above, so every return path -- including every early failure --
+// leaves it at a well-defined 0.0.0.0 rather than stack/.bss garbage,
+// matching net_dns_parse.pdx's own fail-closed posture.
+//
+// -----------------------------------------------------------------------------
+// WEAK_TIMEOUT_FLOOR -- sys_setsockopt has no SO_RCVTIMEO today
+// -----------------------------------------------------------------------------
+//
+// The wave dispatch for this issue asks for "3 seconds via
+// sys_setsockopt (floor-only if kernel gap, WEAK)". Checking the LIVE
+// kernel handler confirms the gap is real:
+// `src/kernel/core/syscall/handlers/sys_setsockopt.pdx` (SC+ ID 99,
+// R95.M1-001 #2076) only recognizes SO_REUSEADDR(2)/SO_NONBLOCK(3)
+// under SOL_SOCKET and TCP_NODELAY(100) under IPPROTO_TCP -- there is
+// no SO_RCVTIMEO optname anywhere in that handler
+// (design/user/syscall-table.md row 99 confirms the same three-option
+// list). `net_resolve_udp_set_timeout_weak` (below) issues the
+// syscall anyway with a documented PLACEHOLDER optname so it is
+// EXPECTED to come back -EINVAL every time against today's kernel --
+// the moment a real SO_RCVTIMEO lands kernel-side, this exact call
+// site starts working with zero caller-visible change (the same
+// "ships anyway, named as a known gap" posture
+// design/networking/r100-user-tools-plan.md §2.3 prescribes for this
+// whole function: "M2's actual landing, if UDP is not yet available,
+// ships the query-builder and response-parser as pure functions...
+// and stubs the socket half"). Its return value is discarded by
+// `net_resolve_udp` -- a caller cannot distinguish "kernel doesn't
+// support this yet" from "kernel refused for some other reason", and
+// at this landing neither case should abort a resolve attempt. Actual
+// non-response detection instead falls back to the recv-returns-0
+// case per step 6 above, which is a REAL (if coarse) substitute for a
+// kernel-side deadline given UDP recv already never blocks on an
+// empty ring.
+//
+// -----------------------------------------------------------------------------
+// WEAK -- resolver server address is a placeholder constant
+// -----------------------------------------------------------------------------
+//
+// §9.4 of the plan specifies the real source of the resolver's IP:
+// a boot-seeded config file (`/boot/resolv.default`) read at runtime.
+// That boot-seeding mechanism is not part of this wave's five issues
+// and is not yet landed anywhere in the tree. This file therefore
+// resolves against a fixed placeholder (loopback, 127.0.0.1:53) via
+// `NRU_WEAK_RESOLVER_IP` / `NRU_WEAK_RESOLVER_PORT` -- the SWAP SITE
+// for §9.4's real boot-seeded read is exactly these two constants;
+// no other line in this file changes when that lands. A future
+// `--server=` override (§9.4's own escape hatch) would thread an
+// explicit resolver-address argument through this function's
+// signature at that time.
+//
+// =============================================================================
+// paideia-as compliance
+// =============================================================================
+//
+//   - Module name PascalCase basename (`NetResolveUdp`) matches file.
+//   - Labels prefixed `nur_` -- disjoint from every other label prefix
+//     in this repo, avoids reserved keywords.
+//   - No `test rN, rN` -- cmp/jl/jle/je/jne/jge only.
+//   - Every `cmp` operand here is a small imm32 (0, 8, 10, 32, 53,
+//     0xFF, 0x10..0x17) -- none reach the wide-immediate encoder gap,
+//     so no `cmp reg, imm; ...` staging through r11 is needed anywhere
+//     in this file. `mov rax, 0xFFFFFFFF`-shaped wide MOVs are not
+//     used either (this file's own sentinels all fit small imm32).
+//   - Register-plan discipline across nested calls: `rbx`=host_ptr,
+//     `rbp`=host_len (then repurposed to hold the sent TXID once
+//     host_len is no longer needed), `r12`=qtype (then repurposed to
+//     hold the socket fd once qtype is baked into the query buffer),
+//     `r13`=out_addr_ptr (held live for the ENTIRE function -- every
+//     nested call this file makes either never touches r13 (the leaf
+//     trampolines / net_dns_txid_verify) or explicitly preserves it
+//     via its own push/pop discipline (net_dns_build_query preserves
+//     rbx/rbp/r12/r13 -- NOT r14/r15, which it uses as internal
+//     scratch without saving; net_dns_parse_response preserves all
+//     six of rbx/rbp/r12/r13/r14/r15). `r14`/`r15` are therefore only
+//     ever used as short-lived, always-recomputed-via-`lea`
+//     scratch immediately before whichever call needs them, never
+//     relied upon to survive a `call net_dns_build_query` site.
+//   - 6-push callee-save prologue (rbx/rbp/r12/r13/r14/r15), NO
+//     persistent pad, matching net_dns_parse_response's own exact
+//     alignment shape: entry rsp%16==8, six pushes land rsp%16==8
+//     (the function-body baseline); each individual nested `call`
+//     site brackets itself with a local `sub rsp,8` (baseline 8 -> 0
+//     immediately before the call) / `add rsp,8` (0 -> 8, back to
+//     baseline, immediately after) rather than one pad held for the
+//     whole function body.
+
+module NetResolveUdp = structure {
+
+  // === Status aliases (from NetTypes.DnsErr / NetErr bands) =================
+  pub let NRU_DNS_OK               : u64 = 0x10
+  pub let NRU_DNS_ERR_NXDOMAIN     : u64 = 0x11
+  pub let NRU_DNS_ERR_TIMEOUT      : u64 = 0x12
+  pub let NRU_DNS_ERR_MALFORMED    : u64 = 0x13
+  pub let NRU_DNS_ERR_SERVFAIL     : u64 = 0x16
+  pub let NRU_DNS_ERR_REFUSED      : u64 = 0x17
+  pub let NRU_NET_ERR_SYSCALL      : u64 = 0x07
+
+  // === Socket domain/type constants (confirmed against the live
+  //     sys_socket.pdx handler -- AF_INET=2, SOCK_DGRAM=2, proto=0) ==========
+  pub let NRU_AF_INET     : u64 = 2
+  pub let NRU_SOCK_DGRAM  : u64 = 2
+  pub let NRU_PROTO_ANY   : u64 = 0
+
+  // === WEAK placeholder resolver address (see file header) ==================
+  pub let NRU_WEAK_RESOLVER_IP   : u64 = 0x7F000001   // 127.0.0.1, packed BE
+  pub let NRU_WEAK_RESOLVER_PORT : u64 = 53
+
+  // === Module-private scratch (single-threaded per §0.3, same
+  //     posture net_dns_txid.pdx's own counter already documents) ===========
+  pub let mut _nru_params_scratch : [u8; 32]  = uninit @align(8)
+  pub let mut _nru_outlen_scratch : [u8; 8]   = uninit @align(8)
+  pub let mut _nru_query_scratch  : [u8; 512] = uninit @align(8)
+  pub let mut _nru_resp_scratch   : [u8; 512] = uninit @align(8)
+  pub let mut _nru_cname_scratch  : [u8; 256] = uninit @align(8)
+  pub let mut _nru_timeout_val    : u64 = 3   // seconds; WEAK_TIMEOUT_FLOOR
+                                               // -- see file header, never
+                                               // actually consulted by the
+                                               // live kernel today.
+
+  // ==========================================================================
+  // net_resolve_udp_set_timeout_weak(fd) -> u64
+  //
+  // See WEAK_TIMEOUT_FLOOR file-header note. Issues a raw
+  // sys_setsockopt(fd, SOL_SOCKET=1, <placeholder optname>=20,
+  // &_nru_timeout_val, 8) -- SC+ ID 99. EXPECTED to return -EINVAL
+  // against every kernel shipped as of this landing (no SO_RCVTIMEO
+  // optname exists yet); the caller (net_resolve_udp) discards this
+  // return value unconditionally.
+  // ==========================================================================
+  pub let net_resolve_udp_set_timeout_weak : (u64) -> u64 !{sysreg} @{} =
+    fn (fd: u64) -> unsafe {
+      effects: {sysreg}, capabilities: {},
+      justification: "libpdx-net.M2-007 (#10): WEAK_TIMEOUT_FLOOR -- floor-only 3-second recv-timeout attempt via raw sys_setsockopt (SC+99). fd (rdi, the curried arg) is left untouched and doubles as syscall arg0 -- no shuffling needed. rsi=SOL_SOCKET(1), rdx=20 (documented PLACEHOLDER optname; the live sys_setsockopt.pdx handler's SOL_SOCKET arm only recognizes SO_REUSEADDR=2/SO_NONBLOCK=3, so this optname is EXPECTED to be refused -EINVAL until a real SO_RCVTIMEO lands kernel-side), r10=&_nru_timeout_val (optval_ptr, per design/user/syscall-table.md's syscall calling convention: 'r10 = arg3 per Linux SYSCALL -- rcx is clobbered by the CPU'), r8=8 (optlen). `mov rax,99; syscall; ret`. Every immediate is small imm32; no `test rN,rN`. Leaf, one `lea`, no stack, nothing to label.",
+      block: {
+        lea r10, [rip + _nru_timeout_val];   // optval_ptr
+        mov rsi, 1;                          // SOL_SOCKET
+        mov rdx, 20;                         // WEAK placeholder optname
+        mov r8, 8;                           // optlen
+        mov rax, 99;
+        syscall;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // net_resolve_udp(host_ptr, host_len, qtype, out_addr_ptr) -> u64
+  // ==========================================================================
+  //
+  // See file header for the full 10-step contract and register plan.
+  // ==========================================================================
+  pub let net_resolve_udp : (u64, u64, u64, u64) -> u64 !{sysreg, mem} @{boot} =
+    fn (host_ptr: u64, host_len: u64, qtype: u64, out_addr_ptr: u64) -> unsafe {
+      effects: {sysreg, mem}, capabilities: {boot},
+      justification: "libpdx-net.M2-007 (#10): UDP transport wiring the already-landed DNS query builder (net_dns_query.pdx) and response parser (net_dns_parse.pdx) over a real connected-UDP socket (net_tcp.pdx's trampolines, transport-agnostic per this file's own header). 6-push callee-save prologue (rbx=host_ptr, rbp=host_len then repurposed as sent-TXID, r12=qtype then repurposed as fd, r13=out_addr_ptr held live throughout, r14/r15 pure scratch), NO persistent pad -- entry rsp%16==8, six pushes land rsp%16==8 (function-body baseline); each nested call site individually brackets itself with a local `sub rsp,8` (baseline -> 0 for the call) / `add rsp,8` (back to baseline) immediately after, the same per-call-site (not frame-wide) padding shape net_dns_parse_response's own body uses. Phase 0: zero out_addr_ptr[0..3] (fail-closed default for every early-exit path). Phase 1: build the params_ptr struct (qtype@0, qclass=IN@8, out_ptr=&_nru_query_scratch@16, out_max=512@24) and call net_dns_build_query(host_ptr, host_len, params_ptr, &_nru_outlen_scratch); net_dns_build_query does NOT preserve r14/r15 (it uses them as its own internal scratch without saving), so nothing this function needs alive is kept there across that call -- only rbx/rbp/r12/r13 (which it DOES preserve) hold anything at that point. On failure (rax != DNSQ_OK=0x10) returns rax directly (already a DnsErr-band code, out_addr_ptr already zeroed). Phase 2: read query_len from _nru_outlen_scratch into r9 and the sent TXID from the query buffer's first two bytes (network order) into rbp (host_len's slot, no longer needed). Phase 3: net_tcp_socket(AF_INET=2, SOCK_DGRAM=2, 0) -> fd; sign-tested via `cmp rax,0; jl` (matches this tree's 'sign-testable' convention, e.g. cap/verify.pdx) rather than a wide-imm64 cmp; on success fd moves into r12 (qtype's slot, no longer needed). Phase 4: net_tcp_connect(fd, NRU_WEAK_RESOLVER_IP, 53) (WEAK placeholder address, see file header) -- failure closes nothing yet (no separate cleanup needed, socket create failed path never reaches here) but jumps to a post-socket failure tail that DOES call net_tcp_close(fd) before returning NRU_NET_ERR_SYSCALL, so a mid-sequence failure never leaks the fd. Phase 5: best-effort net_resolve_udp_set_timeout_weak(fd) call, return value unconditionally discarded. Phase 6: net_tcp_send(fd, &_nru_query_scratch, query_len); failure -> post-socket fail tail. Phase 7: net_tcp_recv(fd, &_nru_resp_scratch, 512); failure -> post-socket fail tail; a clean 0-byte return (UDP's already-established non-blocking-empty-ring convention) closes the fd and returns NRU_DNS_ERR_TIMEOUT (0x12) directly. Phase 8: net_tcp_close(fd) (return value ignored -- nothing meaningful to do with a close failure once the response bytes are already in hand). Phase 9: net_dns_parse_response(&_nru_resp_scratch, resp_len, out_addr_ptr, &_nru_cname_scratch) -- preserves rbx/rbp/r12/r13/r14/r15 across itself (6-push discipline documented in its own file), so rbp (sent TXID) and r13 (out_addr_ptr) both survive intact; rcode result saved into r9 (query_len's slot, no longer needed). Phase 10: extract the response TXID from _nru_resp_scratch's first two bytes into rsi, call net_dns_txid_verify(rbp, rsi) (sent, recv) -- on mismatch (rax != TXID_DNS_OK=0x10) force out_addr_ptr back to all-zero (defensive -- an unverified response's parsed address must never be trusted, matching §2.3.1's mandatory-gate requirement) and return DNS_ERR_TXID_MISMATCH (0x15) directly. Phase 11 (rcode mapping tail): r9==0xFF (bad header sentinel from parse) or r9==0 (NOERROR) or r9==3 (NXDOMAIN) or r9==2 (SERVFAIL) or r9==5 (REFUSED) each map to their NetTypes.DnsErr-band equivalent via a `cmp r9,N; je ...` chain; any other rcode value falls through to DNS_ERR_MALFORMED (0x13). No `test rN,rN` anywhere. Labels prefixed nur_.",
+      block: {
+        push rbx;
+        push rbp;
+        push r12;
+        push r13;
+        push r14;
+        push r15;
+
+        mov rbx, rdi;                      // host_ptr
+        mov rbp, rsi;                      // host_len
+        mov r12, rdx;                      // qtype
+        mov r13, rcx;                      // out_addr_ptr
+
+        // Phase 0: fail-closed default.
+        mov_b [r13 + 0], 0;
+        mov_b [r13 + 1], 0;
+        mov_b [r13 + 2], 0;
+        mov_b [r13 + 3], 0;
+
+        // Phase 1: build the query.
+        lea r14, [rip + _nru_params_scratch];
+        mov [r14 + 0], r12;               // qtype
+        mov [r14 + 8], 1;                 // qclass = IN
+        lea r8, [rip + _nru_query_scratch];
+        mov [r14 + 16], r8;               // out_ptr
+        mov [r14 + 24], 512;              // out_max
+
+        lea r15, [rip + _nru_outlen_scratch];
+
+        mov rdi, rbx;
+        mov rsi, rbp;
+        mov rdx, r14;
+        mov rcx, r15;
+        sub rsp, 8;
+        call net_dns_build_query;
+        add rsp, 8;
+
+        cmp rax, 0x10;                    // DNSQ_OK
+        jne nur_done;                     // rax already the failing code
+
+        // Phase 2: query_len (r9) + sent TXID (rbp).
+        lea r8, [rip + _nru_outlen_scratch];
+        mov r9, [r8 + 0];                 // r9 = query_len
+
+        lea r8, [rip + _nru_query_scratch];
+        xor rax, rax;
+        mov_b rax, [r8 + 0];
+        shl rax, 8;
+        xor r10, r10;
+        mov_b r10, [r8 + 1];
+        or  rax, r10;
+        mov rbp, rax;                     // rbp = sent TXID
+
+        // Phase 3: socket.
+        mov rdi, 2;                       // AF_INET
+        mov rsi, 2;                       // SOCK_DGRAM
+        mov rdx, 0;                       // proto
+        sub rsp, 8;
+        call net_tcp_socket;
+        add rsp, 8;
+
+        cmp rax, 0;
+        jl  nur_fail_presock;
+
+        mov r12, rax;                     // r12 = fd
+
+        // Phase 4: connect.
+        mov rdi, r12;
+        mov rsi, 0x7F000001;              // NRU_WEAK_RESOLVER_IP
+        mov rdx, 53;                      // NRU_WEAK_RESOLVER_PORT
+        sub rsp, 8;
+        call net_tcp_connect;
+        add rsp, 8;
+
+        cmp rax, 0;
+        jl  nur_fail_postsock;
+
+        // Phase 5: best-effort timeout floor (return value discarded).
+        mov rdi, r12;
+        sub rsp, 8;
+        call net_resolve_udp_set_timeout_weak;
+        add rsp, 8;
+
+        // Phase 6: send.
+        lea r14, [rip + _nru_query_scratch];
+        mov rdi, r12;
+        mov rsi, r14;
+        mov rdx, r9;
+        sub rsp, 8;
+        call net_tcp_send;
+        add rsp, 8;
+
+        cmp rax, 0;
+        jl  nur_fail_postsock;
+
+        // Phase 7: recv.
+        lea r14, [rip + _nru_resp_scratch];
+        mov rdi, r12;
+        mov rsi, r14;
+        mov rdx, 512;
+        sub rsp, 8;
+        call net_tcp_recv;
+        add rsp, 8;
+
+        cmp rax, 0;
+        jl  nur_fail_postsock;
+        je  nur_timeout;
+
+        mov r9, rax;                      // r9 = resp_len
+
+        // Phase 8: close (best-effort, ignored).
+        mov rdi, r12;
+        sub rsp, 8;
+        call net_tcp_close;
+        add rsp, 8;
+
+        // Phase 9: parse.
+        lea rdi, [rip + _nru_resp_scratch];
+        mov rsi, r9;                      // resp_len
+        mov rdx, r13;                     // out_addr_ptr
+        lea rcx, [rip + _nru_cname_scratch];
+        sub rsp, 8;
+        call net_dns_parse_response;
+        add rsp, 8;
+
+        mov r9, rax;                      // r9 = rcode
+
+        // Phase 10: TXID verify gate (mandatory per §2.3.1).
+        lea r8, [rip + _nru_resp_scratch];
+        xor rax, rax;
+        mov_b rax, [r8 + 0];
+        shl rax, 8;
+        xor r10, r10;
+        mov_b r10, [r8 + 1];
+        or  rax, r10;
+        mov rsi, rax;                     // recv TXID
+        mov rdi, rbp;                     // sent TXID
+        sub rsp, 8;
+        call net_dns_txid_verify;
+        add rsp, 8;
+
+        cmp rax, 0x10;                    // TXID_DNS_OK
+        jne nur_txid_mismatch;
+
+        // Phase 11: rcode -> DnsErr band.
+        cmp r9, 0xFF;
+        je  nur_ret_malformed;
+        cmp r9, 0;
+        je  nur_ret_ok;
+        cmp r9, 3;
+        je  nur_ret_nxdomain;
+        cmp r9, 2;
+        je  nur_ret_servfail;
+        cmp r9, 5;
+        je  nur_ret_refused;
+        jmp nur_ret_malformed;
+
+      nur_ret_ok:
+        mov rax, 0x10;
+        jmp nur_done;
+
+      nur_ret_nxdomain:
+        mov rax, 0x11;
+        jmp nur_done;
+
+      nur_ret_servfail:
+        mov rax, 0x16;
+        jmp nur_done;
+
+      nur_ret_refused:
+        mov rax, 0x17;
+        jmp nur_done;
+
+      nur_ret_malformed:
+        mov rax, 0x13;
+        jmp nur_done;
+
+      nur_txid_mismatch:
+        mov_b [r13 + 0], 0;
+        mov_b [r13 + 1], 0;
+        mov_b [r13 + 2], 0;
+        mov_b [r13 + 3], 0;
+        mov rax, 0x15;                    // DNS_ERR_TXID_MISMATCH
+        jmp nur_done;
+
+      nur_timeout:
+        mov rdi, r12;
+        sub rsp, 8;
+        call net_tcp_close;
+        add rsp, 8;
+        mov rax, 0x12;                    // DNS_ERR_TIMEOUT
+        jmp nur_done;
+
+      nur_fail_postsock:
+        mov rdi, r12;
+        sub rsp, 8;
+        call net_tcp_close;
+        add rsp, 8;
+        mov rax, 0x07;                    // NET_ERR_SYSCALL
+        jmp nur_done;
+
+      nur_fail_presock:
+        mov rax, 0x07;                    // NET_ERR_SYSCALL
+
+      nur_done:
+        pop r15;
+        pop r14;
+        pop r13;
+        pop r12;
+        pop rbp;
+        pop rbx;
+        ret
+      }
+    }
+
+}

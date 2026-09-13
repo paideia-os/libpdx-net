@@ -1,0 +1,129 @@
+// src/net_tls_key_schedule.pdx -- libpdx-net.M3-002 (libpdx-net#12)
+//
+// TLS 1.3 key schedule (HKDF-Extract/Expand, SHA-256) -- scaffold-only,
+// R100-PREP-005 blocked.
+//
+// =============================================================================
+// SCOPE (design/networking/r100-user-tools-plan.md §2.4 + §12.4)
+// =============================================================================
+//
+// RFC 8446 §7.1's key schedule derives, in sequence:
+//
+//   early_secret      = HKDF-Extract(salt=0, ikm=0)                (no PSK at v1)
+//   handshake_secret  = HKDF-Extract(salt=Derive-Secret(early_secret,
+//                                          "derived", ""),
+//                                    ikm=shared_secret)             (ECDHE output)
+//   master_secret     = HKDF-Extract(salt=Derive-Secret(handshake_secret,
+//                                          "derived", ""),
+//                                    ikm=0)
+//
+// `net_tls_key_derive(shared_secret_ptr, shared_secret_len,
+// out_secrets_ptr) -> u64` is the intended real-body call site for
+// this sequence, writing all three 32-byte SHA-256-sized secrets into
+// a caller-owned 96-byte buffer (early@+0, handshake@+32, master@+64).
+//
+// -----------------------------------------------------------------------------
+// Why this is a WEAK stub, not a real HKDF body
+// -----------------------------------------------------------------------------
+//
+// The wave dispatch for this issue asks to use paideia-as's HKDF
+// intrinsic "if linkable (`paideia_crypto_hkdf_sha256`), else WEAK
+// stub returning deterministic zero-secret." Checking the live
+// paideia-as tree resolves this cleanly: HMAC-SHA256 + HKDF-Extract/
+// Expand DID land in `paideia-as-crypto::kdf::hkdf`
+// (tools/paideia-as/CHANGELOG.md, issue #1339, v0.26.0) -- but as
+// internal Rust trait methods only. The extern-C FFI thunk layer that
+// makes a paideia-as intrinsic CALLABLE from `.pdx` source
+// (`paideia-as-crypto::ffi`, issue #1348) exposes exactly THREE
+// symbols today: `paideia_crypto_argon2id_derive`,
+// `paideia_crypto_chacha20_poly1305_seal`,
+// `paideia_crypto_chacha20_poly1305_open` -- plus the separate ML-KEM
+// thunks (`paideia_crypto_ml_kem_768_{keygen,encaps,decaps}`). There
+// is NO `paideia_crypto_hkdf_sha256` (or any HKDF/HMAC-SHA256) extern
+// symbol anywhere in that FFI layer -- `.pdx` code has no `call`
+// target to reach the landed HKDF implementation with. This is
+// exactly the "if linkable" branch resolving to "not linkable", so
+// this file ships the WEAK stub side: `net_tls_key_derive` zero-fills
+// the 96-byte output buffer (fail-closed -- a zeroed secret can never
+// be mistaken for a live one that merely happens to start with a
+// zero byte, since every one of the 96 bytes is zero) and returns
+// `TKS_ERR_NOT_IMPL` (reusing NetTypes.TLS_ERR_NOT_IMPL, the same
+// established-elsewhere-in-this-repo convention of folding a stub's
+// status through the closest-fit existing enum value rather than
+// minting a parallel one -- net_dns_query.pdx's own
+// `DNSQ_ERR_ENCODE` reuse of `DNS_ERR_MALFORMED` is the precedent).
+//
+// -----------------------------------------------------------------------------
+// R100-PREP-005 blocker (unblock condition for the real body)
+// -----------------------------------------------------------------------------
+//
+// The real body requires an extern-C thunk exposing HKDF-Extract and
+// HKDF-Expand (or a single combined `paideia_crypto_hkdf_sha256`
+// helper) added to `paideia-as-crypto::ffi`, mirroring the shape
+// issue #1348 already established for Argon2id/ChaCha20-Poly1305 --
+// this is filed as the paideia-as-side follow-up (§12.4) libpdx-net
+// tracks as R100-PREP-005; SHA-256 itself (needed for the transcript
+// hash the real M3-002/M3-003 bodies also consume) is ALSO landed
+// internally (#1338, v0.25.0) without an FFI thunk, so the same
+// follow-up should expose both in one pass. Once that thunk exists,
+// the swap here is contained: replace the zero-fill loop with the
+// RFC 8446 §7.1 sequence above, calling through the new extern
+// symbol at each Extract/Expand step; `net_tls_key_derive`'s own
+// signature, its 96-byte output layout, and every caller of it are
+// unaffected.
+//
+// =============================================================================
+// paideia-as compliance
+// =============================================================================
+//
+//   - Module name PascalCase basename (`NetTlsKeySchedule`) matches
+//     file.
+//   - Labels prefixed `tks_` -- disjoint from every other label
+//     prefix in this repo, avoids reserved keywords.
+//   - No `test rN, rN` -- cmp/jge only.
+//   - Leaf function: no nested `call`, so no callee-save prologue and
+//     no stack-alignment padding is needed at all.
+//   - Every immediate here is a small imm32 (96, 0x2F) -- no MOVABS
+//     staging.
+
+module NetTlsKeySchedule = structure {
+
+  pub let TKS_SECRET_BYTES  : u64 = 32
+  pub let TKS_OUT_BUF_BYTES : u64 = 96   // early@0 + handshake@32 + master@64
+
+  pub let TKS_OFF_EARLY_SECRET      : u64 = 0
+  pub let TKS_OFF_HANDSHAKE_SECRET  : u64 = 32
+  pub let TKS_OFF_MASTER_SECRET     : u64 = 64
+
+  pub let TKS_ERR_NOT_IMPL : u64 = 0x2F   // == NetTypes.TLS_ERR_NOT_IMPL
+
+  // ==========================================================================
+  // net_tls_key_derive(shared_secret_ptr, shared_secret_len, out_secrets_ptr) -> u64
+  // ==========================================================================
+  //
+  // WEAK stub -- see file header for the R100-PREP-005 blocker and
+  // the "no linkable paideia_crypto_hkdf_sha256" finding. Zero-fills
+  // the full 96-byte output (early/handshake/master secrets, 32 bytes
+  // each) and returns TKS_ERR_NOT_IMPL; `shared_secret_ptr` /
+  // `shared_secret_len` are accepted (matching the real body's future
+  // signature) but unread at this landing.
+  // ==========================================================================
+  pub let net_tls_key_derive : (u64, u64, u64) -> u64 !{mem} @{} =
+    fn (shared_secret_ptr: u64, shared_secret_len: u64, out_secrets_ptr: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "libpdx-net.M3-002 (#12): WEAK stub for the RFC 8446 §7.1 key schedule -- see file header for the confirmed absence of a linkable `paideia_crypto_hkdf_sha256` extern-C thunk (paideia-as-crypto::ffi exposes only Argon2id/ChaCha20-Poly1305/ML-KEM-768 today, per tools/paideia-as/CHANGELOG.md #1348) and the R100-PREP-005 blocker this stub documents. Leaf -- no nested call, so no callee-save prologue and no alignment padding. rdx=out_secrets_ptr (rdi/rsi = shared_secret_ptr/len, both accepted for future-signature stability but never read at this stub). rax=i (byte index) zero-fills all 96 bytes of *out_secrets_ptr via `cmp rax,96; jge done; mov_b [rdx+rax],0; add rax,1; jmp loop` -- fail-closed: a zeroed 96-byte buffer can never be mistaken for a live secret merely because it happens to start with a zero byte, since every byte is zero. Returns TKS_ERR_NOT_IMPL (0x2F, == NetTypes.TLS_ERR_NOT_IMPL, reused per this repo's established closest-fit-enum-reuse precedent). No `test rN,rN`. Labels prefixed tks_.",
+      block: {
+        xor rax, rax;
+      tks_zero_loop:
+        cmp rax, 96;
+        jge tks_zero_done;
+        mov_b [rdx + rax], 0;
+        add rax, 1;
+        jmp tks_zero_loop;
+      tks_zero_done:
+        mov rax, 0x2F;                   // TKS_ERR_NOT_IMPL
+        ret
+      }
+    }
+
+}

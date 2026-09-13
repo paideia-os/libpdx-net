@@ -33,8 +33,23 @@
 // (module-suffixed there to dodge the same flat-global-symbol
 // collision net_tcp.pdx's `net_tcp_*` naming dodges), folding that
 // engine's out-pointer result back into this stub's original
-// two-argument, direct-return public contract. `net_bind`
-// (M2-002, #5), `net_resolve`, and `net_tls_wrap` remain stubs.
+// two-argument, direct-return public contract. `net_resolve` and
+// `net_tls_wrap` remain stubs.
+//
+// M2-002 (#5) swaps `net_bind` too: it becomes a thin adapter over
+// net_server.pdx's real `net_server_bind(fd, local_port)` engine
+// (the live kernel ABI has no sockaddr concept at all -- see
+// net_server.pdx's own header for the trust-the-live-code
+// confirmation). This file's original `net_bind(sock, sa_va, sa_len)`
+// public contract is preserved; `sa_va` is read as a pointer to a
+// single 8-byte `local_port` value (the smallest sockaddr-shaped
+// generalization that still matches the kernel's actual (fd, port)
+// ABI) and `sa_len` is bound-checked >= 8. This same landing ALSO
+// adds two brand-new public entries, `net_listen(sock, backlog)` and
+// `net_accept(sock)`, as plain one-hop delegations to net_server.pdx's
+// `net_server_listen` / `net_server_accept` -- the original M1-002 API
+// contract never named these two at all (see the updated API CONTRACT
+// list below), so there is no stub to swap; they are purely additive.
 //
 // =============================================================================
 // API CONTRACT (per plan §2.1)
@@ -50,6 +65,8 @@
 //   net_resolve(name_va, name_len, out_va)      -> u64  DNS_OK  | DNS_ERR_*
 //   net_tls_wrap(sock, host_va, host_len, trust_cap)
 //                                               -> u64  TLS_OK  | TLS_ERR_*
+//   net_listen(sock, backlog)                   -> u64  0 | -errno   (M2-002, #5 -- NEW)
+//   net_accept(sock)                            -> u64  new_fd | -errno (M2-002, #5 -- NEW)
 //
 // The four-argument cap on `net_tls_wrap` is deliberately the
 // current paideia-as SysV curried-fn ceiling; every other API
@@ -101,6 +118,12 @@
 //     2-push prologue + `sub rsp,24`/`add rsp,24` (the adapter's
 //     scratch buffer) -- entry rsp%16==8 in every case, landing
 //     rsp%16==0 immediately before the call.
+//   - The M2-002 (#5) net_bind adapter uses a 1-push prologue
+//     (rbx=sock) with NO further pad -- one push already lands
+//     rsp%16==0, the same shape sys_listen.pdx documents. The two NEW
+//     net_listen/net_accept delegations use the plain `sub rsp,8`/
+//     `add rsp,8` shape (entry rsp%16==8, no push) like every other
+//     bare delegation in this file.
 
 module NetApi = structure {
 
@@ -137,14 +160,75 @@ module NetApi = structure {
   // ==========================================================================
   // net_bind(sock, sa_va, sa_len) -> u64
   //
-  // Future body: SC+ 88 (sys_bind). Blocked on M2-002 (#5).
+  // SWAP (M2-002, #5): delegates to net_server.pdx's real
+  // `net_server_bind(fd, local_port)` engine. The kernel ABI has no
+  // sockaddr concept (single configured interface -- see
+  // net_server.pdx's own header for the live-code confirmation), so
+  // this adapter reads `local_port` as a single 8-byte value pointed
+  // to by `sa_va` (the smallest sockaddr-shaped generalization that
+  // still matches the real (fd, port) ABI) rather than decoding a
+  // POSIX sockaddr_in. `sa_len` is bound-checked >= 8 before the read.
   // ==========================================================================
-  pub let net_bind : (u64, u64, u64) -> u64 !{} @{} =
+  pub let net_bind : (u64, u64, u64) -> u64 !{sysreg, mem} @{} =
     fn (sock: u64, sa_va: u64, sa_len: u64) -> unsafe {
-      effects: {}, capabilities: {},
-      justification: "libpdx-net.M1-002 (#2) API stub for net_bind -- real body blocked on M2-002 (#5) SC+88 wrapper. Returns NET_ERR_NOT_IMPL (0x0F, small imm32); leaf. Labels prefixed libpdxnet_api_bind_.",
+      effects: {sysreg, mem}, capabilities: {},
+      justification: "libpdx-net.M2-002 (#5) SWAP: net_bind adapter over net_server.pdx's real net_server_bind(fd, local_port). Landed as a separate net_server_* symbol rather than inline here to avoid a duplicate-definition link failure once this file and net_server.pdx join the same libpdx-net.a archive -- same rationale net_tcp.pdx's own header documents for M2-001. This stub's ORIGINAL public contract is `(sock, sa_va, sa_len)`; since the live kernel bind ABI is only `(fd, local_port)` with no sockaddr struct at all, the adapter reads local_port as a bare 8-byte value at `[sa_va + 0]` rather than decoding any sockaddr_in-shaped layout -- refuses `sa_len < 8` with NET_ERR_INVAL (0x01) before touching sa_va at all (guards a caller that passed a too-small buffer). 1-push callee-save (rbx=sock): entry rsp%16==8, one push lands rsp%16==0 directly, so the nested call needs no further pad -- the same already-aligned-after-one-push shape sys_listen.pdx's own justification documents. rdi=rbx (sock/fd), rsi=[sa_va+0] (local_port) loaded into rsi before the call. No `test rN,rN` (cmp/jl gate on sa_len). Effects widen from `{}` to `{sysreg, mem}` (sysreg propagated from net_server_bind's own syscall; mem for the one 8-byte read of *sa_va). Labels prefixed libpdxnet_api_bind_.",
       block: {
-        mov rax, 0x0F;                 // NET_ERR_NOT_IMPL
+        push rbx;
+        mov rbx, rdi;                  // sock (fd)
+
+        cmp rdx, 8;
+        jl  libpdxnet_api_bind_inval;
+
+        mov rdx, [rsi + 0];            // local_port = *sa_va
+
+        mov rdi, rbx;
+        mov rsi, rdx;
+        call net_server_bind;
+
+        pop rbx;
+        ret;
+
+      libpdxnet_api_bind_inval:
+        mov rax, 0x01;                 // NET_ERR_INVAL
+        pop rbx;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // net_listen(sock, backlog) -> u64
+  //
+  // NEW (M2-002, #5): the original M1-002 API contract never named a
+  // listen entry point. Plain one-hop delegation to net_server.pdx's
+  // net_server_listen, added additively (no stub existed to swap).
+  // ==========================================================================
+  pub let net_listen : (u64, u64) -> u64 !{sysreg} @{} =
+    fn (sock: u64, backlog: u64) -> unsafe {
+      effects: {sysreg}, capabilities: {},
+      justification: "libpdx-net.M2-002 (#5) NEW: net_listen delegates to net_server.pdx's net_server_listen real SC+89 trampoline. Not part of the original nine-symbol M1-002 API contract -- added additively since a server-side SDK surface needs SOME public listen entry point. `sub rsp,8; call net_server_listen; add rsp,8; ret`: entry rsp%16==8 (no push), pad -> 0 for the call, undo after. Args (rdi/rsi = sock/backlog) pass through unchanged. No labels needed.",
+      block: {
+        sub rsp, 8;
+        call net_server_listen;
+        add rsp, 8;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // net_accept(sock) -> u64
+  //
+  // NEW (M2-002, #5): same additive rationale as net_listen above.
+  // Plain one-hop delegation to net_server.pdx's net_server_accept.
+  // ==========================================================================
+  pub let net_accept : (u64) -> u64 !{sysreg} @{} =
+    fn (sock: u64) -> unsafe {
+      effects: {sysreg}, capabilities: {},
+      justification: "libpdx-net.M2-002 (#5) NEW: net_accept delegates to net_server.pdx's net_server_accept real SC+90 trampoline. Not part of the original nine-symbol M1-002 API contract -- added additively (same rationale as net_listen above). `sub rsp,8; call net_server_accept; add rsp,8; ret`: entry rsp%16==8 (no push), pad -> 0 for the call, undo after. Single arg (rdi=sock) passes through unchanged. This syscall blocks kernel-side when no connection is pending (see net_server.pdx's own accept note) -- this delegation does nothing different for that case, it just forwards. No labels needed.",
+      block: {
+        sub rsp, 8;
+        call net_server_accept;
+        add rsp, 8;
         ret
       }
     }

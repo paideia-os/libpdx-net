@@ -1,0 +1,143 @@
+// src/net_server.pdx -- libpdx-net.M2-002 (libpdx-net#5)
+//
+// Real server-side wrapper: raw syscall trampolines for bind/listen/
+// accept over SC+ 88/89/90.
+//
+// =============================================================================
+// SCOPE
+// =============================================================================
+//
+// Trust-the-live-code discipline (the same posture net_tcp.pdx's own
+// header documents for M2-001): design/user/syscall-table.md's prose
+// for sysno 88 lists a `sockaddr_ptr` argument, but that document's
+// own row for sysno 88 (as of this landing) and the LIVE kernel
+// handler bodies both confirm the real ABI is narrower --
+// paideia-os's socket family has no sockaddr concept at all (single
+// configured interface, no multi-address bind):
+//
+//   src/kernel/core/syscall/handlers/sys_bind.pdx    L5: "sys_bind(fd, local_port) -> 0 | -errno. SC+ ID 88. No sockaddr struct at MVP..."
+//   src/kernel/core/syscall/handlers/sys_listen.pdx  L3: "sys_listen(fd, backlog) -> 0 | -errno. SC+ ID 89."
+//   src/kernel/core/syscall/handlers/sys_accept.pdx  L4: "sys_accept(fd) -> new_fd | -errno. SC+ ID 90."
+//
+// `tools/user/pdxsock/src/main.pdx` (the one live consumer of this
+// exact ABI today) independently reconfirms this and calls out the
+// syscall-table's `sockaddr_ptr` column as "aspirational" prose that
+// does not match the live handlers. This file therefore publishes
+// trampolines at the REAL two/two/one-argument shapes rather than the
+// wave dispatch's generic "explicit fd + explicit ptr/len args"
+// paraphrase -- the same kind of live-code correction net_tcp.pdx's
+// own header already made for M2-001's socket/connect/send/recv
+// wrappers.
+//
+//   net_server_bind  (fd, local_port) -> u64   SC+ 88
+//   net_server_listen(fd, backlog)    -> u64   SC+ 89
+//   net_server_accept(fd)             -> u64   SC+ 90
+//
+// Every argument already sits in the exact register both the SysV
+// curried-fn ABI and the SC+ syscall ABI agree on at these arities
+// (rdi[/rsi]), so -- exactly like net_tcp.pdx's five trampolines --
+// each body is the bare `mov rax, <sysno>; syscall; ret` triplet with
+// no register shuffling.
+//
+// -----------------------------------------------------------------------------
+// Symbol-collision avoidance: `net_server_*` names, net_api.pdx swapped
+// in place
+// -----------------------------------------------------------------------------
+//
+// net_api.pdx already publishes a PUBLIC `net_bind` stub symbol (the
+// stable name any downstream tool that statically links libpdx-net
+// already holds); this file cannot reuse that bare name (paideia-as
+// has no per-module symbol namespacing -- a second `net_bind`
+// definition would be a duplicate-symbol link failure once both
+// object files join the same `libpdx-net.a` archive), so the real
+// bind engine lands here as `net_server_bind`. net_api.pdx's own
+// `net_bind` is swapped, this same landing, into a thin ADAPTER over
+// `net_server_bind` (its original 3-argument `(sock, sa_va, sa_len)`
+// public contract is preserved; `sa_va` is read as a pointer to a
+// single 8-byte `local_port` value rather than a POSIX sockaddr,
+// matching the kernel's own no-sockaddr posture -- see net_api.pdx's
+// updated `net_bind` justification for the full adapter rationale).
+//
+// net_api.pdx does NOT yet publish `net_listen` / `net_accept` at all
+// (the M1-002 API contract only ever named nine symbols: socket /
+// bind / connect / send / recv / close / inet_pton / resolve /
+// tls_wrap -- no server-accept surface). There is therefore no name
+// collision for those two, and this landing ALSO adds two new public
+// entries to net_api.pdx, `net_listen(sock, backlog)` and
+// `net_accept(sock)`, as plain one-hop delegations to this file's
+// `net_server_listen` / `net_server_accept` (same shape as
+// net_api.pdx's existing net_socket/connect/send/recv delegations to
+// net_tcp.pdx) -- server-side workloads (a future `pdxsock`-style
+// listener built on this SDK) need SOME public entry point for these
+// two syscalls, and extending the API contract additively here is
+// cheaper than inventing a second server-only public surface file.
+//
+// =============================================================================
+// paideia-as compliance
+// =============================================================================
+//
+//   - Module name PascalCase basename (`NetServer`) matches file.
+//   - No labels anywhere in this file -- every trampoline is
+//     straight-line (mov + syscall + ret), nothing to prefix; the
+//     reserved-label convention for this module is `nets_` should a
+//     future branch land here.
+//   - No `test rN, rN`; no comparisons at all in this file.
+//   - Every syscall number (88, 89, 90) is a small imm32 -- no MOVABS
+//     staging.
+//   - `effects: {sysreg}` on every trampoline, matching net_tcp.pdx's
+//     own rationale (issuing `syscall` is the documented trigger for
+//     the `sysreg` effect tag); none of these three trampolines
+//     dereferences a pointer itself, so no `mem` effect is claimed.
+//   - `capabilities: {}` -- all three syscalls are ambient at the
+//     syscall-entry level (the kernel handlers' own internal
+//     R_SOCKET_LISTEN / R_NET_PRIVILEGED_PORT checks gate the FD's
+//     own rights bitmap, not a capability this trampoline layer's
+//     caller must separately hold to issue the syscall -- same
+//     posture net_tcp.pdx's header already documents for
+//     socket/connect/send/recv/close).
+
+module NetServer = structure {
+
+  // ============================================================================
+  // net_server_bind(fd, local_port) -> u64   SC+ ID 88
+  // ============================================================================
+  pub let net_server_bind : (u64, u64) -> u64 !{sysreg} @{} =
+    fn (fd: u64, local_port: u64) -> unsafe {
+      effects: {sysreg}, capabilities: {},
+      justification: "libpdx-net.M2-002 (#5): raw sys_bind trampoline, SC+ ID 88. Live kernel ABI is (fd, local_port) -- no sockaddr struct exists (single configured interface; src/kernel/core/syscall/handlers/sys_bind.pdx L5-11 and tools/user/pdxsock/src/main.pdx's own 'sockaddr_ptr prose is aspirational' note both confirm this, matching the trust-the-live-code correction net_tcp.pdx's header already made for M2-001). rdi=fd, rsi=local_port already sit in the exact registers the syscall reads -- no shuffling. `mov rax,88; syscall; ret`. Return value (0 on success, negative errno on failure, including -EACCES for the R_NET_PRIVILEGED_PORT gate on port<1024) passed through unexamined. Leaf, no branch, nothing to label.",
+      block: {
+        mov rax, 88;
+        syscall;
+        ret
+      }
+    }
+
+  // ============================================================================
+  // net_server_listen(fd, backlog) -> u64   SC+ ID 89
+  // ============================================================================
+  pub let net_server_listen : (u64, u64) -> u64 !{sysreg} @{} =
+    fn (fd: u64, backlog: u64) -> unsafe {
+      effects: {sysreg}, capabilities: {},
+      justification: "libpdx-net.M2-002 (#5): raw sys_listen trampoline, SC+ ID 89. rdi=fd, rsi=backlog already sit in the syscall's argument registers (backlog is accepted but ignored kernel-side per sys_listen.pdx's own header -- MVP backlog is exactly one pending connection). `mov rax,89; syscall; ret`. Return value (0 on success, negative errno -- e.g. -EACCES for a missing R_SOCKET_LISTEN right, -EINVAL for listen-before-bind -- on failure) passed through unexamined. Leaf, no branch, nothing to label.",
+      block: {
+        mov rax, 89;
+        syscall;
+        ret
+      }
+    }
+
+  // ============================================================================
+  // net_server_accept(fd) -> u64   SC+ ID 90
+  // ============================================================================
+  pub let net_server_accept : (u64) -> u64 !{sysreg} @{} =
+    fn (fd: u64) -> unsafe {
+      effects: {sysreg}, capabilities: {},
+      justification: "libpdx-net.M2-002 (#5): raw sys_accept trampoline, SC+ ID 90. rdi=fd already sits in the syscall's argument register. `mov rax,90; syscall; ret`. This syscall BLOCKS kernel-side (sched_block) when no connection is pending per sys_accept.pdx's R94.M4-001 note -- this trampoline does not itself do anything different for the blocking case, it just issues the syscall and lets the kernel park the caller; the return value (new fd on success, negative errno such as -EAGAIN in the defensive wake-race case) is passed through unexamined. Leaf, no branch, nothing to label.",
+      block: {
+        mov rax, 90;
+        syscall;
+        ret
+      }
+    }
+
+}

@@ -30,12 +30,35 @@
 # over the M1-002 stubs); every other net_bind/net_resolve/
 # net_tls_wrap stub in net_api.pdx remains unswapped.
 #
-# net_bind/listen/accept/shutdown (SC+ 88/89/90/94) and the UDP path
-# remain unconsumed pending their own milestones (M2-002 #5 and
-# R100-PREP-002 respectively) -- every OTHER function shipped is
-# either a pure transformation over caller-provided byte buffers or
-# a fail-closed stub whose real body will land after the R100 PREP
-# items resolve.
+# As of v0.4.0 (Wave NN, M2-002 #5), net_server.pdx's three
+# trampolines consume the remaining server-side socket syscalls:
+#
+#   * `sys_bind`    (SC+ ID 88) -- net_server_bind
+#   * `sys_listen`  (SC+ ID 89) -- net_server_listen
+#   * `sys_accept`  (SC+ ID 90) -- net_server_accept
+#
+# All three are ambient at the syscall-entry level, same posture as
+# the five M2-001 trampolines above -- the kernel handlers' own
+# internal R_SOCKET_LISTEN / R_NET_PRIVILEGED_PORT checks gate the
+# CALLER'S FD's own rights bitmap (set at sys_socket mint time), not a
+# capability this trampoline layer's own caller must separately hold
+# to issue the syscall. net_api.pdx's net_bind now delegates to
+# net_server_bind (in-place swap over the M1-002 stub); net_listen /
+# net_accept are brand-new net_api.pdx public entries (additive, no
+# stub existed for either).
+#
+# net_resolve_udp.pdx (M2-007 #10, also v0.4.0) additionally issues a
+# raw `sys_setsockopt` (SC+ ID 99) call as a WEAK, floor-only 3-second
+# receive-timeout attempt -- confirmed against the LIVE
+# sys_setsockopt.pdx handler to be a documented no-op today (that
+# handler's SOL_SOCKET arm only recognizes SO_REUSEADDR(2)/
+# SO_NONBLOCK(3); no SO_RCVTIMEO optname exists yet). Also ambient
+# (no cap gate); its return value is unconditionally discarded by the
+# one caller in this tree. See net_resolve_udp.pdx's own
+# WEAK_TIMEOUT_FLOOR header note.
+#
+# `sys_shutdown` (SC+ 94) remains unconsumed -- no milestone in this
+# tree names it yet.
 #
 # Two syscalls the library ALSO consumes for the resolver TXID
 # path (M3-006, net_dns_txid.pdx):
@@ -53,7 +76,7 @@
 # MINTED capabilities the consumer must grant. When a real CSPRNG
 # capability lands (KIND_CSPRNG, currently unfiled) this file grows
 # a real `requires:` line pointing at it and the TXID path swaps.
-requires: <none at v0.3.0 -- every syscall consumed above is ambient>
+requires: <none at v0.4.0 -- every syscall consumed above is ambient>
 
 # --- Declared output schemas (semantic-pipe records libpdx-net emits
 #     via sys_semantic_send). --------------------------------------------
@@ -98,7 +121,22 @@ consumes_input_schemas: []
 #     server public key it verifies the transcript signature against.
 #     At v0.1.0 the trust cap is fronted by a stub (accepts any cap
 #     slot, KEY_MISMATCH always) -- pdxtrust M2 (issue #-- pending)
-#     mints the real ones.
+#     mints the real ones. As of v0.4.0 (M3-001 #11), net_tls_wrap
+#     ACCEPTS a trust_cap argument (matching the issue's own
+#     four-argument contract) but never reads it -- there is no
+#     verification of any kind at this scaffold landing, so the
+#     capability is not yet consumed in practice either.
+#
+#   R100-PREP-005 (paideia-as crypto FFI thunks -- SHA-256/HKDF)
+#     -- as of v0.4.0, confirmed NOT linkable from `.pdx`: HKDF-Extract/
+#     Expand + HMAC-SHA256 landed internally in paideia-as-crypto
+#     (#1339, v0.26.0) and SHA-256 likewise (#1338, v0.25.0), but
+#     neither has an extern-C thunk in paideia-as-crypto::ffi (#1348
+#     exposes only Argon2id / ChaCha20-Poly1305 / ML-KEM-768 today).
+#     net_tls_key_schedule.pdx's net_tls_key_derive is therefore a
+#     WEAK zero-secret stub pending this thunk landing paideia-as-side
+#     -- see that file's own header for the full finding and swap-site
+#     note.
 #
 #   KIND_CSPRNG         (unfiled)                              -- the
 #     future replacement for the WEAK_ENTROPY_FALLBACK path in

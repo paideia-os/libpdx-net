@@ -20,7 +20,7 @@
 # -- the mkfs.pdxfs pattern (parses, does not transmit, ships anyway).
 
 name        = libpdx-net
-version     = 0.3.0
+version     = 0.4.0
 kind        = shared-library
 output      = build-out/libpdx-net.a
 caps_decl   = caps.decl
@@ -46,6 +46,11 @@ sources:
   - src/net_inet.pdx            # M2-004: dotted-quad IPv4 parse engine (#7)
   - src/net_dns_query.pdx       # M2-005: DNS query builder (#8)
   - src/net_dns_parse.pdx       # M2-006: DNS response parser (#9)
+  - src/net_server.pdx          # M2-002: real bind/listen/accept trampolines (#5)
+  - src/net_resolve_udp.pdx     # M2-007: net_resolve UDP transport (#10)
+  - src/net_http_redirect.pdx   # M4-004: redirect method-preservation matrix (#20)
+  - src/net_tls_wrap.pdx        # M3-001: TLS 1.3 ClientHello (scaffold) (#11)
+  - src/net_tls_key_schedule.pdx # M3-002: TLS 1.3 key schedule (scaffold) (#12)
 
 # --- Library dependencies ---------------------------------------------
 # libpdx-net at v0.2.0 depends on nothing outside the SC+ syscall

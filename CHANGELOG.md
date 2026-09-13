@@ -3,6 +3,76 @@
 All notable changes to this repository are documented here. Versioning
 follows SemVer with a v0.x series until the M5 signed release.
 
+## [0.4.0] -- 2026-09-13 (Wave NN: M2/M3/M4 tail)
+
+**Scope:** land the remaining five M2/M3/M4 issues -- server-side
+socket ops, the UDP resolver transport, redirect handling, and a
+TLS 1.3 ClientHello + key-schedule scaffold pair.
+
+### Landed
+
+- `#5` -- **M2-002 real bind/listen/accept.** `src/net_server.pdx`
+  (module `NetServer`) publishes `net_server_bind`/
+  `net_server_listen`/`net_server_accept` over SC+ 88/89/90.
+  Live-code check found the kernel ABI has no sockaddr concept at
+  all (`(fd, local_port)`/`(fd, backlog)`/`(fd)` respectively,
+  confirmed against `sys_bind.pdx`/`sys_listen.pdx`/`sys_accept.pdx`
+  and `pdxsock`'s own "sockaddr_ptr prose is aspirational" note) --
+  same trust-the-live-code correction net_tcp.pdx made for M2-001.
+  `net_api.pdx`'s `net_bind` swaps to an adapter (reads `local_port`
+  from an 8-byte value at `sa_va`); `net_listen`/`net_accept` are
+  brand-new additive public entries (the M1-002 contract never named
+  either).
+
+- `#10` -- **M2-007 UDP resolver transport.** `src/net_resolve_udp.pdx`
+  (module `NetResolveUdp`) publishes `net_resolve_udp(host_ptr,
+  host_len, qtype, out_addr_ptr) -> u64`, wiring
+  `net_dns_build_query` -> `net_tcp_socket`/`net_tcp_connect`/
+  `net_tcp_send`/`net_tcp_recv`/`net_tcp_close` -> `net_dns_parse_response`
+  -> `net_dns_txid_verify` (the TXID gate is mandatory and runs BEFORE
+  any parsed address is trusted, per §2.3.1). WEAK floor-only 3-second
+  `sys_setsockopt` timeout attempt (confirmed no-op against the live
+  kernel -- no SO_RCVTIMEO optname exists in `sys_setsockopt.pdx`
+  yet) with a real fallback: a same-call zero-byte UDP recv (already
+  non-blocking on an empty ring) is treated as `DNS_ERR_TIMEOUT`. WEAK
+  placeholder resolver address (127.0.0.1:53) pending §9.4's
+  boot-seeded `/boot/resolv.default` read.
+
+- `#20` -- **M4-004 redirect handling.** `src/net_http_redirect.pdx`
+  (module `NetHttpRedirect`) publishes
+  `net_http_follow_redirect(status_code, orig_method, params_ptr,
+  hop_count) -> u64`: 301/302/303 downgrade POST to GET, 307/308
+  preserve the method verbatim, a 10-hop cap checked before any
+  status dispatch, and a cross-scheme (https->http) downgrade refusal
+  checked uniformly across all five redirect statuses. Packs
+  `location_ptr`/`location_len`/`orig_is_https` behind `params_ptr`
+  (the issue's literal 5-argument signature exceeds the paideia-as
+  4-argument ceiling, and the scheme-downgrade requirement needs an
+  `orig_is_https` slot the issue's own signature never named).
+
+- `#11` -- **M3-001 TLS 1.3 ClientHello (scaffold).**
+  `src/net_tls_wrap.pdx` (module `NetTlsWrap`) publishes
+  `net_tls_wrap(sock_fd, trust_cap, hostname_ptr, hostname_len) ->
+  u64`: composes a fixed 158-byte ClientHello (32-byte SNI slot,
+  TLS_AES_128_GCM_SHA256, x25519 + ed25519 + TLS 1.3-only extensions)
+  and emits it via `net_tcp_send`. WEAK-zero `random` and the
+  `key_share` public key; does not wait for or parse a ServerHello.
+  `trust_cap` is accepted (four-argument contract) but unread --
+  R100-PREP-005 blocked for any real verification.
+
+- `#12` -- **M3-002 TLS 1.3 key schedule (scaffold).**
+  `src/net_tls_key_schedule.pdx` (module `NetTlsKeySchedule`)
+  publishes `net_tls_key_derive(shared_secret_ptr, shared_secret_len,
+  out_secrets_ptr) -> u64`. Live-code check of `paideia-as-crypto`
+  confirms HKDF-Extract/Expand + HMAC-SHA256 (#1339, v0.26.0) and
+  SHA-256 (#1338, v0.25.0) landed as INTERNAL Rust traits with no
+  extern-C FFI thunk (`paideia-as-crypto::ffi` / #1348 exposes only
+  Argon2id / ChaCha20-Poly1305 / ML-KEM-768) -- `paideia_crypto_hkdf_sha256`
+  is not a linkable symbol. Ships the WEAK stub side: zero-fills the
+  96-byte early/handshake/master secret output and returns
+  `TLS_ERR_NOT_IMPL`; documents the exact paideia-as-side follow-up
+  needed to unblock the real body.
+
 ## [0.3.0] -- 2026-09-13 (Wave MM: M2 pure-function cohort)
 
 **Scope:** land five M2 issues -- the first real (non-stub) bodies

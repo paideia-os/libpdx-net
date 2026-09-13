@@ -44,20 +44,42 @@ libpdx-argv     >=1.1.3   PENDING   Wave 6 PDX_TOOL_NAME/PDX_TOOL_VERSION
 
 # Kernel primitives consumed directly (KERNEL -- not shared libraries):
 #
-#   sys_getpid                   -- SC+ ID 39; net_dns_txid.pdx v0.1.0
+#   sys_getpid                   -- SC+ ID 39; net_dns_txid.pdx
 #                                    WEAK_ENTROPY_FALLBACK path only
-#   sys_hpet_now_ns              -- SC+ ID 45; net_dns_txid.pdx v0.1.0
+#   sys_hpet_now_ns              -- SC+ ID 45; net_dns_txid.pdx
 #                                    WEAK_ENTROPY_FALLBACK path only
 #   sys_semantic_send            -- SC+ ID 115; TlsHandshakeRecord@0.1
 #                                    emit path (M3-005) once the stub
 #                                    lifts
-#   sys_socket / bind / listen / accept / connect / send / recv /
-#     shutdown / close           -- SC+ IDs 87..94, 3; NOT consumed at
-#                                    v0.1.0 (M2 wrappers not yet
-#                                    scaffolded here; see issues #4/#5)
+#   sys_socket / connect / send / recv / close
+#                                 -- SC+ IDs 87/91/92/93/3; LANDED at
+#                                    v0.3.0 (net_tcp.pdx, M2-001 #4)
+#   sys_bind / listen / accept   -- SC+ IDs 88/89/90; LANDED at v0.4.0
+#                                    (net_server.pdx, M2-002 #5)
+#   sys_setsockopt                -- SC+ ID 99; LANDED (WEAK, floor-only
+#                                    no-op against the live kernel) at
+#                                    v0.4.0 (net_resolve_udp.pdx,
+#                                    M2-007 #10) -- see that file's own
+#                                    WEAK_TIMEOUT_FLOOR header note.
+#   sys_shutdown                  -- SC+ ID 94; NOT consumed -- no
+#                                    milestone in this tree names it yet
 #   ChaCha20Poly1305::seal/open  -- paideia-as intrinsic
 #                                    (#1305/v0.33-004); NOT consumed at
-#                                    v0.1.0 (TLS record layer M3-004
+#                                    v0.4.0 (TLS record layer M3-004
 #                                    not yet scaffolded here; see #14)
+#   paideia_crypto_hkdf_sha256   -- DOES NOT EXIST as a linkable
+#                                    extern-C symbol as of v0.4.0.
+#                                    HKDF-Extract/Expand + HMAC-SHA256
+#                                    landed internally in
+#                                    paideia-as-crypto (#1339, v0.26.0)
+#                                    and SHA-256 likewise (#1338,
+#                                    v0.25.0), but neither has an FFI
+#                                    thunk in paideia-as-crypto::ffi
+#                                    (#1348 exposes only Argon2id /
+#                                    ChaCha20-Poly1305 / ML-KEM-768).
+#                                    net_tls_key_schedule.pdx's
+#                                    net_tls_key_derive is a WEAK
+#                                    zero-secret stub pending this
+#                                    thunk (R100-PREP-005, §12.4).
 #
-# All of the above are ambient at v0.1.0 (no per-caller cap gate).
+# All of the above are ambient at v0.4.0 (no per-caller cap gate).

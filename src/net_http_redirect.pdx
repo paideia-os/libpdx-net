@@ -1,0 +1,245 @@
+// src/net_http_redirect.pdx -- libpdx-net.M4-004 (libpdx-net#20)
+//
+// Redirect handling: 301/302/303/307/308 method-preservation matrix +
+// 10-hop cap + cross-scheme-downgrade refusal.
+//
+// =============================================================================
+// SCOPE (design/networking/r100-user-tools-plan.md §2.5)
+// =============================================================================
+//
+// `net_http_follow_redirect` decides, given a response's status code
+// and the method the ORIGINAL request used, whether a caller (a
+// future HttpClient loop) should re-issue the request against the
+// `Location` header's target and with which method:
+//
+//   301 Moved Permanently  -- POST downgrades to GET (historical
+//   302 Found                 browser behavior RFC 9110 §15.4.2-3
+//   303 See Other              codify: a POST-with-body redirected by
+//                               301/302/303 is conventionally re-sent
+//                               as a bodyless GET); GET stays GET.
+//   307 Temporary Redirect  -- method (and, implicitly, body) MUST be
+//   308 Permanent Redirect     preserved exactly (RFC 9110 §15.4.8-9).
+//   anything else            -- not a redirect status; caller should
+//                               not follow (HR_METHOD_NONE == 0).
+//
+// hop_count >= 10 refuses with HR_ERR_REDIRECT_LIMIT regardless of
+// status code -- checked FIRST, before any status-code dispatch, so a
+// caller looping on this function's return cannot be talked into an
+// unbounded redirect chain no matter what a malicious server sends.
+//
+// A redirect that would take the request from https back down to
+// http is refused with HR_ERR_SCHEME_DOWNGRADE -- RFC 9110 does not
+// mandate this refusal, but it is the same posture curl's
+// `--proto-redir` default and most browsers converged on: an https
+// request silently downgrading to a plaintext connection on redirect
+// is exactly the kind of thing a passive network attacker wants a
+// client to do. The check applies uniformly to every one of the five
+// redirect statuses (301/302/303/307/308 alike), checked BEFORE the
+// method-preservation decision for that status.
+//
+// -----------------------------------------------------------------------------
+// Signature deviates from the issue's literal 5-argument listing --
+// paideia-as 4-argument curried-fn ceiling
+// -----------------------------------------------------------------------------
+//
+// libpdx-net#20 lists the conceptual contract as
+// `net_http_follow_redirect(status_code, orig_method, location_ptr,
+// location_len, hop_count) -> u64` -- five logical inputs, one over
+// the paideia-as curried-fn ceiling (net_api.pdx's own `net_tls_wrap`
+// and net_dns_query.pdx's `net_dns_build_query` already document and
+// apply the same fix). This file packs the trailing three location-
+// scheme-related inputs behind a caller-owned struct:
+//
+//     net_http_follow_redirect(status_code, orig_method, params_ptr, hop_count) -> u64
+//
+// where `params_ptr` points to a caller-owned, 24-byte packed struct:
+//
+//     +0   location_ptr    u64
+//     +8   location_len    u64
+//     +16  orig_is_https   u64 (0 = original request was http,
+//                                nonzero = https)
+//
+// `orig_is_https` is NOT part of the issue's literal parameter list
+// at all, but the issue's own cross-scheme-downgrade requirement is
+// impossible to evaluate without knowing what scheme the ORIGINAL
+// request used (the function only otherwise sees the REDIRECT
+// target's scheme via `location_ptr`) -- this is the same kind of
+// scope correction net_dns_query.pdx's own header documents making
+// against its issue's literal argument list, applied here because the
+// requirement itself demands a second scheme value the issue's
+// signature never named a slot for.
+//
+// -----------------------------------------------------------------------------
+// Method encoding
+// -----------------------------------------------------------------------------
+//
+// `orig_method` / the return value use a small private enum distinct
+// from net_http_request.pdx's `HTTP_METHOD_GET`/`HTTP_METHOD_POST`
+// (NUL-terminated ASCII byte arrays there, unsuited to a return-value
+// slot that must ALSO carry a distinguishable "do not follow"
+// sentinel): `HR_METHOD_NONE` (0, "do not follow" -- deliberately the
+// smallest value so a caller's `cmp rax, 0; je no_follow` needs no
+// wide-immediate staging), `HR_METHOD_GET` (1), `HR_METHOD_POST` (2).
+// Starting the real methods at 1 rather than 0 is deliberate: GET
+// must never collide with the "do not follow" sentinel, unlike a
+// POSIX-style 0-based enum would produce.
+//
+// -----------------------------------------------------------------------------
+// Scheme-prefix detection
+// -----------------------------------------------------------------------------
+//
+// A downgrade is only possible when the ORIGINAL request was https
+// AND the redirect target's `Location` value explicitly names the
+// `http://` scheme (case-sensitive lowercase check at v0.1.0 -- a
+// documented scope cut, real-world servers overwhelmingly emit
+// lowercase scheme prefixes). A `Location` value shorter than 7 bytes
+// or one that does not literally start with the 7 ASCII bytes
+// "http://" is treated as NOT a downgrade -- this correctly covers
+// the common case of a relative `Location` (e.g. "/new-path") which
+// implicitly preserves the CURRENT connection's scheme, and it cannot
+// false-positive against "https://" (the 5th byte 's' vs required
+// ':' mismatches at the very first comparison past "http", so an
+// https target is never mistaken for an http one).
+//
+// =============================================================================
+// paideia-as compliance
+// =============================================================================
+//
+//   - Module name PascalCase basename (`NetHttpRedirect`) matches file.
+//   - Labels prefixed `hr_` -- disjoint from every other label prefix
+//     in this repo, avoids reserved keywords.
+//   - No `test rN, rN` -- cmp/je/jne/jl/jge only.
+//   - No 2-operand `imul`; none used in this file.
+//   - Byte loads go through the xor-then-mov_b idiom per the
+//     paideia-as #1248 zero-extend workaround, same as every other
+//     byte-scanning file in this tree.
+//   - `mov rax, 0xFFFFFFFF` / `mov rax, 0xFFFFFFFE` (the two sentinel
+//     returns) are direct MOVs, not comparisons -- the "cmp reg,
+//     0xFFFFFFFF+ needs r11 staging" encoder pitfall is specifically
+//     about `cmp`, not `mov`; net_dns_parse.pdx's own
+//     `mov rax, 0xFFFFFFFF; // NETDP_OFFSET_ERR` is the proven
+//     precedent for exactly this shape.
+//   - Exactly four curried args (status_code, orig_method, params_ptr,
+//     hop_count) -- at, not over, the paideia-as ceiling.
+//   - Leaf function: no nested `call` anywhere, so no callee-save
+//     prologue and no stack-alignment padding is needed at all.
+
+module NetHttpRedirect = structure {
+
+  // === Status codes this module recognizes as redirects =====================
+  pub let HR_STATUS_301 : u64 = 301
+  pub let HR_STATUS_302 : u64 = 302
+  pub let HR_STATUS_303 : u64 = 303
+  pub let HR_STATUS_307 : u64 = 307
+  pub let HR_STATUS_308 : u64 = 308
+
+  // === Method enum (distinct from net_http_request.pdx's byte-array
+  //     literals -- see file header) ==========================================
+  pub let HR_METHOD_NONE : u64 = 0   // "do not follow" sentinel
+  pub let HR_METHOD_GET  : u64 = 1
+  pub let HR_METHOD_POST : u64 = 2
+
+  // === Hop cap + sentinels ====================================================
+  pub let HR_MAX_HOPS             : u64 = 10
+  pub let HR_ERR_REDIRECT_LIMIT   : u64 = 0xFFFFFFFF
+  pub let HR_ERR_SCHEME_DOWNGRADE : u64 = 0xFFFFFFFE
+
+  // === params_ptr struct offsets (see file header) ===========================
+  pub let HR_PARAM_OFF_LOCATION_PTR  : u64 = 0
+  pub let HR_PARAM_OFF_LOCATION_LEN  : u64 = 8
+  pub let HR_PARAM_OFF_ORIG_IS_HTTPS : u64 = 16
+
+  // ==========================================================================
+  // net_http_follow_redirect(status_code, orig_method, params_ptr, hop_count) -> u64
+  // ==========================================================================
+  //
+  // See file header for the params_ptr packed-struct layout and the
+  // four-argument ceiling rationale.
+  // ==========================================================================
+  pub let net_http_follow_redirect : (u64, u64, u64, u64) -> u64 !{mem} @{} =
+    fn (status_code: u64, orig_method: u64, params_ptr: u64, hop_count: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "libpdx-net.M4-004 (#20): redirect method-preservation matrix. Leaf -- no nested call, no push/pop, no alignment padding. rdi=status_code, rsi=orig_method (also this function's default return value on the preserve-as-is paths), rdx=params_ptr, rcx=hop_count; rax/r8/r9/r10/r11 are scratch. Phase 1: `cmp rcx,10; jge hr_fail_limit` -- checked BEFORE any status-code dispatch so no redirect status can be evaluated past the cap regardless of what a server sends. Phase 2: dispatch on status_code -- 301/302/303 -> hr_downgrade_check (method MAY downgrade), 307/308 -> hr_preserve_check (method MUST NOT downgrade), anything else -> hr_no_follow (HR_METHOD_NONE=0). Phase 3 (both hr_downgrade_check and hr_preserve_check independently, since this function has no nested call to factor a shared subroutine into): load orig_is_https from [params_ptr+16] -- 0 short-circuits straight to the method decision (no downgrade possible from an already-http original). Nonzero: load location_ptr/location_len from [params_ptr+0]/[params_ptr+8]; location_len<7 cannot carry 'http://' (covers relative Location values) -- falls through to the method decision. Otherwise compare the first 7 bytes at location_ptr against the literal ASCII bytes 'h'(0x68) 't'(0x74) 't'(0x74) 'p'(0x70) ':'(0x3A) '/'(0x2F) '/'(0x2F) one xor-then-mov_b-then-cmp-then-jne per byte (any mismatch falls through to the method decision -- this also correctly rejects an 'https://' target, since its 5th byte 's' never equals the required ':'); a full 7-byte match returns HR_ERR_SCHEME_DOWNGRADE (0xFFFFFFFE) immediately. Phase 4 method decision: hr_downgrade_check's tail maps orig_method==HR_METHOD_POST(2) to HR_METHOD_GET(1), anything else (i.e. GET) passes through unchanged via `mov rax,rsi`; hr_preserve_check's tail always passes orig_method through unchanged via `mov rax,rsi` (307/308 never downgrade). `mov rax,0xFFFFFFFF`/`mov rax,0xFFFFFFFE` are direct MOVs (not comparisons), matching net_dns_parse.pdx's own proven `mov rax,0xFFFFFFFF` sentinel-return shape -- the 'cmp reg,0xFFFFFFFF+ needs r11 staging' pitfall applies to `cmp`, not `mov`. No `test rN,rN` anywhere (every zero/value check is `cmp reg,imm`). Labels prefixed hr_.",
+      block: {
+        cmp rcx, 10;
+        jge hr_fail_limit;
+
+        cmp rdi, 301;
+        je  hr_downgrade_check;
+        cmp rdi, 302;
+        je  hr_downgrade_check;
+        cmp rdi, 303;
+        je  hr_downgrade_check;
+        cmp rdi, 307;
+        je  hr_preserve_check;
+        cmp rdi, 308;
+        je  hr_preserve_check;
+        jmp hr_no_follow;
+
+      hr_downgrade_check:
+        mov r8, [rdx + 16];              // orig_is_https
+        cmp r8, 0;
+        je  hr_downgrade_decide;
+
+        mov r9,  [rdx + 0];              // location_ptr
+        mov r10, [rdx + 8];              // location_len
+        cmp r10, 7;
+        jl  hr_downgrade_decide;
+
+        xor r11, r11; mov_b r11, [r9 + 0]; cmp r11, 0x68; jne hr_downgrade_decide;
+        xor r11, r11; mov_b r11, [r9 + 1]; cmp r11, 0x74; jne hr_downgrade_decide;
+        xor r11, r11; mov_b r11, [r9 + 2]; cmp r11, 0x74; jne hr_downgrade_decide;
+        xor r11, r11; mov_b r11, [r9 + 3]; cmp r11, 0x70; jne hr_downgrade_decide;
+        xor r11, r11; mov_b r11, [r9 + 4]; cmp r11, 0x3A; jne hr_downgrade_decide;
+        xor r11, r11; mov_b r11, [r9 + 5]; cmp r11, 0x2F; jne hr_downgrade_decide;
+        xor r11, r11; mov_b r11, [r9 + 6]; cmp r11, 0x2F; jne hr_downgrade_decide;
+
+        mov rax, 0xFFFFFFFE;             // HR_ERR_SCHEME_DOWNGRADE
+        ret;
+
+      hr_downgrade_decide:
+        cmp rsi, 2;                      // HR_METHOD_POST
+        je  hr_ret_get;
+        mov rax, rsi;                    // GET (or anything else) unchanged
+        ret;
+
+      hr_preserve_check:
+        mov r8, [rdx + 16];
+        cmp r8, 0;
+        je  hr_preserve_decide;
+
+        mov r9,  [rdx + 0];
+        mov r10, [rdx + 8];
+        cmp r10, 7;
+        jl  hr_preserve_decide;
+
+        xor r11, r11; mov_b r11, [r9 + 0]; cmp r11, 0x68; jne hr_preserve_decide;
+        xor r11, r11; mov_b r11, [r9 + 1]; cmp r11, 0x74; jne hr_preserve_decide;
+        xor r11, r11; mov_b r11, [r9 + 2]; cmp r11, 0x74; jne hr_preserve_decide;
+        xor r11, r11; mov_b r11, [r9 + 3]; cmp r11, 0x70; jne hr_preserve_decide;
+        xor r11, r11; mov_b r11, [r9 + 4]; cmp r11, 0x3A; jne hr_preserve_decide;
+        xor r11, r11; mov_b r11, [r9 + 5]; cmp r11, 0x2F; jne hr_preserve_decide;
+        xor r11, r11; mov_b r11, [r9 + 6]; cmp r11, 0x2F; jne hr_preserve_decide;
+
+        mov rax, 0xFFFFFFFE;             // HR_ERR_SCHEME_DOWNGRADE
+        ret;
+
+      hr_preserve_decide:
+        mov rax, rsi;                    // 307/308: preserve verbatim
+        ret;
+
+      hr_ret_get:
+        mov rax, 1;                      // HR_METHOD_GET
+        ret;
+
+      hr_no_follow:
+        mov rax, 0;                      // HR_METHOD_NONE
+        ret;
+
+      hr_fail_limit:
+        mov rax, 0xFFFFFFFF;             // HR_ERR_REDIRECT_LIMIT
+        ret
+      }
+    }
+
+}
