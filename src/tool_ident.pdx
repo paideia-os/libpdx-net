@@ -49,17 +49,17 @@ module ToolIdent = structure {
   // VersionBackend::emit_default at run time via `lea rdi, [rip +
   // PDX_TOOL_VERSION]`.
   //
-  // v0.3.0 -- Wave MM (libpdx-net#4/#6/#7/#8/#9): M2 pure-function
-  // cohort. Real net_tcp.pdx SC+ trampolines (#4, M2-001) with
-  // net_api.pdx's net_socket/connect/send/recv/close swapped to
-  // delegate to them; net_endian.pdx htons/ntohs/htonl/ntohl (#6,
-  // M2-003); net_inet.pdx dotted-quad IPv4 parse engine (#7,
-  // M2-004) with net_api.pdx's net_inet_pton swapped to an adapter
-  // over it; net_dns_query.pdx DNS query builder (#8, M2-005);
-  // net_dns_parse.pdx DNS response parser (#9, M2-006). Keep this
-  // literal in lockstep with manifest.pdxproj `version` and the
-  // top CHANGELOG.md entry.
+  // v0.5.0 -- Wave OO (libpdx-net#13/#14): the M3 crypto pair.
+  // net_tls_verify.pdx (#13, M3-003) Ed25519 transcript verify --
+  // WEAK fail-closed scaffold, no linkable Ed25519 path from `.pdx`;
+  // net_tls_record.pdx (#14, M3-004) ChaCha20-Poly1305 record layer
+  // -- a REAL body over the linkable AEAD intrinsic, added as an
+  // additive section of the existing NetTlsRecord module.
+  //
+  // (This literal was left at 0.3.0 through the v0.4.0 landing --
+  // corrected here. Keep it in lockstep with manifest.pdxproj
+  // `version` and the top CHANGELOG.md entry from now on.)
   // ============================================================================
-  pub let PDX_TOOL_VERSION : [u8; 6] = "0.3.0\0"
+  pub let PDX_TOOL_VERSION : [u8; 6] = "0.5.0\0"
 
 }

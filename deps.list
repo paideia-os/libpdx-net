@@ -64,9 +64,43 @@ libpdx-argv     >=1.1.3   PENDING   Wave 6 PDX_TOOL_NAME/PDX_TOOL_VERSION
 #   sys_shutdown                  -- SC+ ID 94; NOT consumed -- no
 #                                    milestone in this tree names it yet
 #   ChaCha20Poly1305::seal/open  -- paideia-as intrinsic
-#                                    (#1305/v0.33-004); NOT consumed at
-#                                    v0.4.0 (TLS record layer M3-004
-#                                    not yet scaffolded here; see #14)
+#                                    (#1305/v0.33-004); CONSUMED FOR
+#                                    REAL as of v0.5.0 (M3-004 #14,
+#                                    net_tls_record.pdx). LINKABLE on
+#                                    both required counts: extern-C
+#                                    thunks `paideia_crypto_chacha20_
+#                                    poly1305_{seal,open}` exist in
+#                                    paideia-as-crypto::ffi, and
+#                                    stdlib_lowering::cryptoops has the
+#                                    matching dispatch arm. Reached via
+#                                    a module-local `trait` redeclaration
+#                                    + plain-lambda wrapper (the recipe
+#                                    fires only on a call expression at
+#                                    a lambda-body position, never from
+#                                    inside an `unsafe` asm block) --
+#                                    template: tools/user/libpdx-volume/
+#                                    src/pdxb_crypto.pdx in paideia-os.
+#                                    Carries @{paideia.crypto}; see
+#                                    caps.decl's `requires:`.
+#
+#   ed25519_verify               -- DOES NOT EXIST as a linkable
+#                                    extern-C symbol as of v0.5.0, and
+#                                    is NOT reachable via stdlib
+#                                    lowering either. The primitive is
+#                                    landed, RFC 8032 test-vector-backed
+#                                    Rust (`paideia_as_crypto::curve::
+#                                    ed25519::ed25519_verify`), but
+#                                    there is no `ffi/ed25519.rs` thunk
+#                                    and no `Ed25519` arm in
+#                                    stdlib_lowering::cryptoops -- so a
+#                                    module-local `trait Ed25519` would
+#                                    fail to ELABORATE, not merely fail
+#                                    to link. net_tls_verify.pdx's
+#                                    net_tls_verify_transcript is a WEAK
+#                                    fail-closed stub pending this thunk
+#                                    (R100-PREP-005, §12.4) -- and
+#                                    additionally pending R100-PREP-001
+#                                    for pubkey provenance.
 #   paideia_crypto_hkdf_sha256   -- DOES NOT EXIST as a linkable
 #                                    extern-C symbol as of v0.4.0.
 #                                    HKDF-Extract/Expand + HMAC-SHA256

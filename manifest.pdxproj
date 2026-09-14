@@ -20,7 +20,7 @@
 # -- the mkfs.pdxfs pattern (parses, does not transmit, ships anyway).
 
 name        = libpdx-net
-version     = 0.4.0
+version     = 0.5.0
 kind        = shared-library
 output      = build-out/libpdx-net.a
 caps_decl   = caps.decl
@@ -37,6 +37,11 @@ sources:
   - src/net_types.pdx           # NetErr/DnsErr/TlsErr/HttpErr enum tags
   - src/net_api.pdx             # M1-002 public API stubs (#2); M2-001/M2-004 swaps
   - src/net_tls_record.pdx      # M3-005: TlsHandshakeRecord@0.1 schema + emit (#15)
+                                #   + M3-004: ChaCha20-Poly1305 record layer (#14)
+                                #     -- additive section in the SAME module; a
+                                #     second `module NetTlsRecord` would be a
+                                #     duplicate-symbol link failure, not a second
+                                #     namespace (see that file's header).
   - src/net_dns_txid.pdx        # M3-006: resolver TXID randomize + verify (#16)
   - src/net_http_request.pdx    # M4-001 GET encode + M4-002 POST encode (#17/#18)
   - src/net_http_response.pdx   # M4-001 status-line + header decode (#17)
@@ -51,6 +56,7 @@ sources:
   - src/net_http_redirect.pdx   # M4-004: redirect method-preservation matrix (#20)
   - src/net_tls_wrap.pdx        # M3-001: TLS 1.3 ClientHello (scaffold) (#11)
   - src/net_tls_key_schedule.pdx # M3-002: TLS 1.3 key schedule (scaffold) (#12)
+  - src/net_tls_verify.pdx      # M3-003: Ed25519 transcript verify (scaffold) (#13)
 
 # --- Library dependencies ---------------------------------------------
 # libpdx-net at v0.2.0 depends on nothing outside the SC+ syscall

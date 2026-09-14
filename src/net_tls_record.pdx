@@ -1,6 +1,35 @@
 // src/net_tls_record.pdx -- libpdx-net.M3-005 (libpdx-net#15)
+//                        +  libpdx-net.M3-004 (libpdx-net#14)
 //
-// TlsHandshakeRecord@0.1 schema bind + emit wire.
+// TlsHandshakeRecord@0.1 schema bind + emit wire (M3-005), and the
+// TLS 1.3 ChaCha20-Poly1305 record layer (M3-004).
+//
+// =============================================================================
+// WHY TWO MILESTONES SHARE ONE MODULE
+// =============================================================================
+//
+// M3-004's issue names `src/net_tls_record.pdx` / `module
+// NetTlsRecord` as its landing site. That file and that module name
+// were already taken by M3-005 (#15), which shipped at v0.4.0.
+// paideia-as binds exactly one `module <PascalBasename>` per file and
+// resolves cross-file deps by that name, so a second `module
+// NetTlsRecord` -- in this file or any other -- is a duplicate-symbol
+// link failure, not a second namespace. M3-004 therefore lands as an
+// ADDITIVE section of the existing module rather than a competing
+// one: no existing symbol, constant, offset or return code changes,
+// and every M3-005 caller is untouched.
+//
+// The two sections are kept strictly disjoint so the eventual split
+// (if the AEAD layer outgrows this file) is mechanical:
+//
+//   M3-005 (audit schema)  constants `TLSR_*`   labels `libpdxnet_tlsr_*`
+//   M3-004 (AEAD records)  constants `TLSREC_*` labels `libpdxnet_tlsrec_*`
+//
+// They are also related in substance, which is why the cohabitation
+// is tolerable rather than merely expedient: M3-005's
+// `negotiated_cipher` enum has exactly one value,
+// TLSR_CIPHER_CHACHA20_POLY1305_SHA256, and M3-004 is the code that
+// makes that value true.
 //
 // =============================================================================
 // SCOPE (design/networking/r100-user-tools-plan.md §10.3 + §13.1)
@@ -196,6 +225,430 @@ module NetTlsRecord = structure {
         ret;
       libpdxnet_tlsr_cv_badbuf:
         mov rax, 0xE1;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // ==========================================================================
+  // M3-004 (libpdx-net#14) -- TLS 1.3 ChaCha20-Poly1305 RECORD LAYER
+  // ==========================================================================
+  // ==========================================================================
+  //
+  // Everything below this banner belongs to M3-004 and is disjoint
+  // from the M3-005 audit-schema section above (see the file header
+  // for the shared-module rationale and the prefix split).
+  //
+  // --------------------------------------------------------------------------
+  // The intrinsic IS linkable -- this is a REAL body, not a stub
+  // --------------------------------------------------------------------------
+  //
+  // The wave dispatch asks to use the ChaCha20-Poly1305 intrinsic "if
+  // linkable, else a WEAK stub". Unlike M3-002's HKDF gap and M3-003's
+  // Ed25519 gap (see net_tls_key_schedule.pdx and net_tls_verify.pdx,
+  // both of which resolve to "not linkable"), this conditional
+  // resolves to LINKABLE, on both of the two counts that have to hold:
+  //
+  //   1. The extern-C thunks exist.
+  //      `paideia_crypto_chacha20_poly1305_seal` and
+  //      `..._open` are `#[unsafe(no_mangle)] pub unsafe extern "C"`
+  //      symbols in `paideia-as-crypto::ffi::chacha20_poly1305`
+  //      (paideia-as#1305 / #1348 / #1354).
+  //   2. The stdlib lowering recipe exists.
+  //      `stdlib_lowering::cryptoops::chacha20_poly1305` dispatches
+  //      `ChaCha20Poly1305::seal` / `::open` onto those two symbols.
+  //
+  // and it is already exercised end-to-end by a shipping user-space
+  // `.pdx` library in this org: tools/user/libpdx-volume/src/
+  // pdxb_crypto.pdx (libpdx-volume.M5-001 #29), whose
+  // `pdxb_dek_wrap`/`pdxb_dek_unwrap` are the template this section
+  // follows verbatim -- module-local `trait` redeclaration, a
+  // plain-lambda tail-expression wrapper per method, and a
+  // `.bss`-resident `AeadParamsC` scratch.
+  //
+  // The lowering recipe fires ONLY on a call expression at a
+  // lambda-body / tail-expression position; it is NOT reachable from
+  // inside an `unsafe` asm block. Hence the two `*_raw` wrappers
+  // below: the asm bodies `call` those, and the wrappers carry the
+  // trait call.
+  //
+  // --------------------------------------------------------------------------
+  // R100-PREP-005 blocker: what is STILL missing
+  // --------------------------------------------------------------------------
+  //
+  // A working AEAD is necessary but not sufficient for a real TLS 1.3
+  // record layer, and this section is SCAFFOLD-ONLY for reasons that
+  // sit entirely outside ChaCha20-Poly1305 itself:
+  //
+  //   * No traffic keys. RFC 8446 §7.3 derives
+  //     `client_write_key`/`server_write_key` from the key schedule.
+  //     net_tls_key_schedule.pdx's `net_tls_key_derive` is a WEAK
+  //     zero-secret stub because HKDF-SHA256 has no FFI thunk
+  //     (R100-PREP-005). So `key_ptr` here is a RAW CALLER-SUPPLIED
+  //     POINTER with no provenance -- these functions encrypt
+  //     correctly under whatever key they are handed, and nothing in
+  //     this tree can hand them the right one yet.
+  //
+  //   * No static IV, so the nonce is WEAK. RFC 8446 §5.3 builds the
+  //     per-record nonce as `client_write_iv XOR
+  //     left_pad_64bit(seq_num)`. `client_write_iv` comes from the
+  //     same blocked key schedule, so this scaffold uses a ZERO IV:
+  //     the nonce is 4 zero bytes followed by seq_num big-endian.
+  //     That is the RFC construction with the IV term zeroed, which
+  //     means it is per-(key, seq) unique -- safe against the one
+  //     catastrophic AEAD failure mode (nonce reuse under a fixed
+  //     key) as long as the caller never reuses a seq_num, which the
+  //     TLS record layer's monotonic sequence number guarantees --
+  //     but it is NOT the RFC's nonce and will NOT interoperate with
+  //     a real peer. The swap is one `xor` per byte against the IV
+  //     once the key schedule produces one.
+  //
+  //   * No record header, no AAD. A real TLSCiphertext prepends a
+  //     5-byte header (`opaque_type`, `legacy_record_version`,
+  //     `length`) which RFC 8446 §5.2 also feeds in as the AEAD's
+  //     additional authenticated data. This scaffold seals the bare
+  //     plaintext with `aad_ptr = NULL, aad_len = 0` and emits no
+  //     header; the caller is responsible for framing. Adding AAD is
+  //     two stores into the params scratch, and is deliberately
+  //     deferred to the landing that also adds the header, so header
+  //     bytes and AAD bytes can never disagree.
+  //
+  // What DOES work today, for real: given a 32-byte key and a
+  // sequence number, these two functions perform genuine
+  // ChaCha20-Poly1305 sealing and opening with genuine Poly1305 tag
+  // verification. `net_tls_open_record` will REFUSE a tampered
+  // ciphertext. That is a real security property and it is live at
+  // this landing.
+  //
+  // --------------------------------------------------------------------------
+  // Output length (why there is no out_len argument)
+  // --------------------------------------------------------------------------
+  //
+  // Both signatures are fixed at six arguments by the issue and by
+  // the SysV integer-register ceiling, leaving no slot for an
+  // out-length pointer. The lengths are deterministic, so none is
+  // needed: seal writes exactly `len + TLSREC_TAG_BYTES` bytes and
+  // open writes exactly `len - TLSREC_TAG_BYTES`. The count the
+  // intrinsic itself reported is additionally published in
+  // `net_tls_record_last_written` for callers that prefer to read it
+  // rather than recompute it -- note that slot is a single
+  // module-scoped location and is therefore NOT reentrant (same
+  // single-writer-by-convention discipline as pdxb_crypto.pdx's own
+  // scratch, and consistent with §0.3's single-threaded user tools).
+  //
+  // --------------------------------------------------------------------------
+  // paideia-as compliance (M3-004 section)
+  // --------------------------------------------------------------------------
+  //
+  //   - Labels prefixed `libpdxnet_tlsrec_` -- disjoint from the
+  //     M3-005 section's `libpdxnet_tlsr_` prefix and from every
+  //     other prefix in this repo; free of reserved keywords
+  //     (`loop`, `if`, ...).
+  //   - No `test rN, rN` anywhere -- `cmp reg, 0` + je/jne only.
+  //   - No `cmp reg, imm64`: every compared immediate (0, 16, 16384,
+  //     16400) is a small imm32, and no comparison against a wide
+  //     immediate occurs at all. The intrinsic's negative return
+  //     codes are never compared individually (a single `cmp rax, 0;
+  //     jne` covers every failure), so no MOVABS comparand staging is
+  //     needed either.
+  //   - No `imul` in any form; no wide `and reg, imm64` (the only
+  //     masks are `and rax, 0xFF`, a small imm32).
+  //   - Stack: both bodies are non-leaf (one nested `call` each) with
+  //     ZERO pushes, so entry `rsp % 16 == 8` and a single
+  //     `sub rsp, 8` / `add rsp, 8` bracket puts `rsp % 16 == 0` at
+  //     the call site -- the same shape net_api.pdx's delegating
+  //     bodies use.
+  //   - Every size constant is stated against its RFC: key 32 (RFC
+  //     8439 §2.8), nonce 12 (§2.8), tag 16 (§2.8), max plaintext
+  //     16384 (RFC 8446 §5.2's 2^14 TLSInnerPlaintext ceiling). The
+  //     sealed/opened ceiling is 16400 = 16384 + 16 exactly, with no
+  //     length-prefix or tag byte unaccounted for.
+  //   - String literals: none.
+
+  // === RFC 8439 / RFC 8446 wire sizes =======================================
+  pub let TLSREC_KEY_BYTES   : u64 = 32      // ChaCha20 key (RFC 8439 §2.8)
+  pub let TLSREC_NONCE_BYTES : u64 = 12      // AEAD nonce  (RFC 8439 §2.8)
+  pub let TLSREC_TAG_BYTES   : u64 = 16      // Poly1305 tag (RFC 8439 §2.8)
+
+  // Largest plaintext a single TLS 1.3 record may carry: 2^14 bytes
+  // (RFC 8446 §5.2). Sealed form adds exactly one tag.
+  pub let TLSREC_MAX_PLAINTEXT : u64 = 16384
+  pub let TLSREC_MAX_SEALED    : u64 = 16400   // == 16384 + 16, exact
+
+  // Byte offset of the sequence number inside the 12-byte nonce.
+  // RFC 8446 §5.3 left-pads the 64-bit sequence number to the nonce
+  // length, so the 8 sequence bytes occupy [4..11] and [0..3] are the
+  // padding -- zero here, `client_write_iv` in the real body.
+  pub let TLSREC_NONCE_SEQ_OFF : u64 = 4
+
+  // === Return-code domain ===================================================
+  //
+  // Folded through the closest-fit NetTypes values rather than
+  // minting a parallel domain -- this repo's established precedent.
+  pub let TLSREC_OK        : u64 = 0x20   // == NetTypes.TLS_OK
+  pub let TLSREC_ERR_INVAL : u64 = 0x01   // == NetTypes.NET_ERR_INVAL
+                                           //    (caller arg shape wrong;
+                                           //     refused before the
+                                           //     intrinsic is reached)
+  pub let TLSREC_ERR_AEAD  : u64 = 0x25   // == NetTypes.TLS_ERR_BAD_RECORD,
+                                           //    whose documented meaning is
+                                           //    exactly "AEAD open failed" --
+                                           //    on open this is a Poly1305
+                                           //    tag mismatch (tampered or
+                                           //    corrupt record); on seal it
+                                           //    is an intrinsic-internal
+                                           //    failure.
+
+  // --------------------------------------------------------------------------
+  // Module-local trait redeclaration.
+  //
+  // Verbatim from tools/paideia-as/crates/paideia-as-stdlib/pdx/
+  // crypto/chacha20_poly1305.pdx. Redeclared locally because the
+  // elaborator's cryptoops recipe dispatches on the literal
+  // (trait_name, method_name) pair at the call site, not on a
+  // cross-crate import -- same reasoning pdxb_crypto.pdx's own header
+  // documents for its MlDsa65 / Argon2id / ChaCha20Poly1305
+  // redeclarations.
+  // --------------------------------------------------------------------------
+  trait ChaCha20Poly1305 {
+    fn seal(params: u64, plaintext_ptr: u64, plaintext_len: u64,
+            out_ptr: u64, out_cap: u64, written_ptr: u64)
+      -> i64 !{crypto, mem} @{paideia.crypto};
+    fn open(params: u64, sealed_ptr: u64, sealed_len: u64,
+            out_ptr: u64, out_cap: u64, written_ptr: u64)
+      -> i64 !{crypto, mem} @{paideia.crypto};
+  }
+
+  // --------------------------------------------------------------------------
+  // Plain-lambda trait-call wrappers. The ONLY way to reach the
+  // stdlib-lowering recipe is a call expression at a lambda-body /
+  // tail-expression position (it is not reachable from inside an
+  // `unsafe` asm block), so the asm bodies below `call` these.
+  // Argument order and register mapping are the intrinsic's own:
+  // rdi=params, rsi=ptr, rdx=len, rcx=out_ptr, r8=out_cap,
+  // r9=written_ptr, rax=i64 return code.
+  // --------------------------------------------------------------------------
+  pub let net_tls_record_seal_raw :
+    (u64, u64, u64, u64, u64, u64) -> i64 !{crypto, mem} @{paideia.crypto} =
+    fn (params: u64, plaintext_ptr: u64, plaintext_len: u64,
+        out_ptr: u64, out_cap: u64, written_ptr: u64) ->
+      ChaCha20Poly1305::seal(params, plaintext_ptr, plaintext_len,
+                             out_ptr, out_cap, written_ptr)
+
+  pub let net_tls_record_open_raw :
+    (u64, u64, u64, u64, u64, u64) -> i64 !{crypto, mem} @{paideia.crypto} =
+    fn (params: u64, sealed_ptr: u64, sealed_len: u64,
+        out_ptr: u64, out_cap: u64, written_ptr: u64) ->
+      ChaCha20Poly1305::open(params, sealed_ptr, sealed_len,
+                            out_ptr, out_cap, written_ptr)
+
+  // --------------------------------------------------------------------------
+  // Module-scoped AEAD scratch. `.bss`-resident rather than
+  // stack-allocated so each body stays a zero-push non-leaf (see the
+  // stack note in the compliance block). NOT reentrant -- single
+  // writer by convention, per §0.3.
+  // --------------------------------------------------------------------------
+
+  // AeadParamsC (Rust #[repr(C)], verified against
+  // paideia-as-crypto/src/ffi/mod.rs): key_ptr, nonce_ptr, aad_ptr,
+  // aad_len -- four u64 slots, 32 bytes exactly.
+  pub let mut net_tls_record_aead_params : [u8; 32] = uninit @align(8)
+
+  // The 12-byte per-record nonce (RFC 8446 §5.3 construction with a
+  // zero IV -- see the WEAK note in the blocker section above).
+  // Declared 16 bytes so the following `@align(8)` slot needs no
+  // padding fixups; only [0..11] are ever read by the intrinsic.
+  pub let mut net_tls_record_nonce : [u8; 16] = uninit @align(8)
+
+  // Byte count the intrinsic reported writing. Published (not
+  // underscore-private) because callers may legitimately read it
+  // instead of recomputing len +/- TLSREC_TAG_BYTES.
+  pub let mut net_tls_record_last_written : u64 = uninit @align(8)
+
+  // ==========================================================================
+  // net_tls_seal_record(key_ptr, seq_num, plaintext_ptr, len,
+  //                     out_ptr, out_max) -> u64
+  //
+  // Seals `len` plaintext bytes under the 32-byte key at `key_ptr`
+  // with the per-record nonce derived from `seq_num`, writing
+  // `len + 16` bytes (ciphertext || Poly1305 tag) to `out_ptr`.
+  //
+  // Returns TLSREC_OK (0x20) on success, TLSREC_ERR_INVAL (0x01) for
+  // a NULL pointer / an oversized `len` / an `out_max` too small to
+  // hold the tag, and TLSREC_ERR_AEAD (0x25) if the intrinsic itself
+  // refuses.
+  //
+  // SCAFFOLD: zero IV, no record header, no AAD, and `key_ptr` has
+  // no provenance -- see the blocker section above before wiring
+  // this into anything that must interoperate.
+  // ==========================================================================
+  pub let net_tls_seal_record :
+    (u64, u64, u64, u64, u64, u64) -> u64 !{crypto, mem} @{paideia.crypto} =
+    fn (key_ptr: u64, seq_num: u64, plaintext_ptr: u64, len: u64,
+        out_ptr: u64, out_max: u64) -> unsafe {
+      effects: {crypto, mem}, capabilities: {paideia.crypto},
+      justification: "libpdx-net.M3-004 (#14): real ChaCha20-Poly1305 seal over the linkable paideia-as intrinsic (thunk `paideia_crypto_chacha20_poly1305_seal` + cryptoops lowering recipe both confirmed present; template is tools/user/libpdx-volume/src/pdxb_crypto.pdx's pdxb_dek_wrap). Gates first, all with cmp/je-jne-ja-jb, never `test rN,rN`: rdi(key_ptr)!=0, rdx(plaintext_ptr)!=0, r8(out_ptr)!=0; rcx(len) <= 16384 (RFC 8446 §5.2 2^14 ceiling) via `cmp rcx,16384; ja bad` -- an UNSIGNED compare so a caller passing a bit-63-set length is refused rather than read as negative, and the ceiling also proves the following `add r10,16` cannot wrap; then needed=len+16 in r10 and `cmp r9,r10; jb bad` (unsigned again: an absurd bit-63-set out_max fails closed). Nonce build: `lea r11,[rip+net_tls_record_nonce]`, four imm-source `mov_b [r11+0..3],0` for the zero-IV pad, then eight reg-source byte stores walking seq_num's low byte into [r11+11] down to [r11+4] with a constant `shr r10,8` between each -- storing low-byte-last-position-first yields big-endian without any variable shift and without bswap (no production .pdx body exercises bswap; see net_endian.pdx's header). `and rax,0xFF` before each store is a small imm32 mask, never a wide imm64 AND on an extended register. Params build: `lea r10,[rip+net_tls_record_aead_params]`, [+0]=rdi key_ptr, [+8]=r11 nonce_ptr, [+16]=[+24]=0 (no AAD -- deferred with the record header so header bytes and AAD bytes can never disagree). SysV shuffle is ordered so no live value is clobbered before use: rsi<-rdx, rdx<-rcx, rcx<-r8, r8<-r9, r9<-lea written, rdi<-r10 (rsi's own seq_num was fully consumed into the nonce before rsi is overwritten). Stack: zero pushes, entry rsp%16==8, `sub rsp,8` -> 0 at the call, `add rsp,8` after -- the net_api.pdx delegating-body shape. Result map: `cmp rax,0; jne fail` covers every negative intrinsic code with ONE comparison against a small imm32, so no MOVABS comparand staging is needed at all; success returns 0x20 (TLSREC_OK), failure 0x25 (TLSREC_ERR_AEAD == NetTypes.TLS_ERR_BAD_RECORD), shape failure 0x01 (TLSREC_ERR_INVAL == NetTypes.NET_ERR_INVAL). Labels prefixed libpdxnet_tlsrec_s_.",
+      block: {
+        cmp rdi, 0;
+        je  libpdxnet_tlsrec_s_bad;
+        cmp rdx, 0;
+        je  libpdxnet_tlsrec_s_bad;
+        cmp r8, 0;
+        je  libpdxnet_tlsrec_s_bad;
+
+        cmp rcx, 16384;                  // TLSREC_MAX_PLAINTEXT
+        ja  libpdxnet_tlsrec_s_bad;
+
+        mov r10, rcx;
+        add r10, 16;                     // needed = len + TLSREC_TAG_BYTES
+        cmp r9, r10;
+        jb  libpdxnet_tlsrec_s_bad;      // out_max < needed
+
+        // --- nonce = 0x00000000 || seq_num (big-endian, 8 bytes) ---
+        lea r11, [rip + net_tls_record_nonce];
+        mov_b [r11 + 0], 0;
+        mov_b [r11 + 1], 0;
+        mov_b [r11 + 2], 0;
+        mov_b [r11 + 3], 0;
+
+        mov r10, rsi;                    // seq working copy
+        mov rax, r10; and rax, 0xFF; mov_b [r11 + 11], rax; shr r10, 8;
+        mov rax, r10; and rax, 0xFF; mov_b [r11 + 10], rax; shr r10, 8;
+        mov rax, r10; and rax, 0xFF; mov_b [r11 +  9], rax; shr r10, 8;
+        mov rax, r10; and rax, 0xFF; mov_b [r11 +  8], rax; shr r10, 8;
+        mov rax, r10; and rax, 0xFF; mov_b [r11 +  7], rax; shr r10, 8;
+        mov rax, r10; and rax, 0xFF; mov_b [r11 +  6], rax; shr r10, 8;
+        mov rax, r10; and rax, 0xFF; mov_b [r11 +  5], rax; shr r10, 8;
+        mov rax, r10; and rax, 0xFF; mov_b [r11 +  4], rax;
+
+        // --- AeadParamsC { key_ptr, nonce_ptr, aad_ptr=0, aad_len=0 } ---
+        lea r10, [rip + net_tls_record_aead_params];
+        mov [r10 + 0], rdi;              // key_ptr
+        mov [r10 + 8], r11;              // nonce_ptr
+        xor rax, rax;
+        mov [r10 + 16], rax;             // aad_ptr = NULL
+        mov [r10 + 24], rax;             // aad_len = 0
+
+        // --- shuffle into seal_raw(params, pt, pt_len, out, cap, written) ---
+        mov rsi, rdx;                    // plaintext_ptr
+        mov rdx, rcx;                    // plaintext_len
+        mov rcx, r8;                     // out_ptr
+        mov r8,  r9;                     // out_cap
+        lea r9,  [rip + net_tls_record_last_written];
+        mov rdi, r10;                    // params
+
+        sub rsp, 8;
+        call net_tls_record_seal_raw;
+        add rsp, 8;
+
+        cmp rax, 0;
+        jne libpdxnet_tlsrec_s_fail;
+        mov rax, 0x20;                   // TLSREC_OK
+        ret;
+
+      libpdxnet_tlsrec_s_fail:
+        mov rax, 0x25;                   // TLSREC_ERR_AEAD
+        ret;
+
+      libpdxnet_tlsrec_s_bad:
+        mov rax, 0x01;                   // TLSREC_ERR_INVAL
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // net_tls_open_record(key_ptr, seq_num, ciphertext_ptr, len,
+  //                     out_ptr, out_max) -> u64
+  //
+  // Inverse of net_tls_seal_record. `len` is the SEALED length
+  // (ciphertext || tag), so it must be at least TLSREC_TAG_BYTES and
+  // at most TLSREC_MAX_SEALED; on success exactly `len - 16`
+  // plaintext bytes land at `out_ptr`.
+  //
+  // Returns TLSREC_OK (0x20) on success. TLSREC_ERR_AEAD (0x25) means
+  // the Poly1305 tag did not verify -- the record was tampered with
+  // or corrupted, and NO bytes were written to `out_ptr`. This is a
+  // real check performed by the real primitive: it is the one
+  // security property of this section that is live at this landing.
+  // TLSREC_ERR_INVAL (0x01) is a caller-shape refusal made before the
+  // intrinsic is reached.
+  //
+  // Reminder: the nonce must match the one used to seal, which means
+  // the caller must present the SAME seq_num. See the blocker section
+  // for the zero-IV / no-AAD scaffold limits.
+  // ==========================================================================
+  pub let net_tls_open_record :
+    (u64, u64, u64, u64, u64, u64) -> u64 !{crypto, mem} @{paideia.crypto} =
+    fn (key_ptr: u64, seq_num: u64, ciphertext_ptr: u64, len: u64,
+        out_ptr: u64, out_max: u64) -> unsafe {
+      effects: {crypto, mem}, capabilities: {paideia.crypto},
+      justification: "libpdx-net.M3-004 (#14): real ChaCha20-Poly1305 open, mirroring net_tls_seal_record instruction-for-instruction except for the length algebra and the wrapper called. Gates: rdi(key_ptr)!=0, rdx(ciphertext_ptr)!=0, r8(out_ptr)!=0; rcx(len) is the SEALED length so it is bounded on BOTH sides -- `cmp rcx,16; jb bad` (a record shorter than the Poly1305 tag cannot contain one; this is the off-by-one that matters here and it is an exact >=16, not >16) and `cmp rcx,16400; ja bad` (TLSREC_MAX_SEALED == 16384+16 exactly). Both unsigned so a bit-63-set length fails closed. needed = len-16 in r10, which cannot underflow because len>=16 was already proven; `cmp r9,r10; jb bad` refuses an out_max too small for the recovered plaintext. Nonce and AeadParamsC construction are byte-identical to the seal body (same zero-IV big-endian seq_num walk, same four-slot params, same `and rax,0xFF` small-imm32 masks) -- the nonce MUST match the sealing nonce, which is why the same seq_num must be presented. Same clobber-safe SysV shuffle (rsi<-rdx, rdx<-rcx, rcx<-r8, r8<-r9, r9<-lea written, rdi<-r10) and the same zero-push `sub rsp,8`/`add rsp,8` bracket for rsp%16==0 at the call. Result map: `cmp rax,0; jne fail` -- one small-imm32 comparison covers every negative code including -3 (AuthenticationFailed), so no MOVABS comparand is needed; 0x25 (TLSREC_ERR_AEAD == NetTypes.TLS_ERR_BAD_RECORD, documented as exactly 'AEAD open failed') is the right answer for the tag-mismatch case AND for every other intrinsic refusal, and the intrinsic writes nothing to out_ptr on any failure. No `test rN,rN`, no `cmp reg,imm64`, no imul, no wide-imm AND. Labels prefixed libpdxnet_tlsrec_o_.",
+      block: {
+        cmp rdi, 0;
+        je  libpdxnet_tlsrec_o_bad;
+        cmp rdx, 0;
+        je  libpdxnet_tlsrec_o_bad;
+        cmp r8, 0;
+        je  libpdxnet_tlsrec_o_bad;
+
+        cmp rcx, 16;                     // TLSREC_TAG_BYTES -- must hold a tag
+        jb  libpdxnet_tlsrec_o_bad;
+        cmp rcx, 16400;                  // TLSREC_MAX_SEALED
+        ja  libpdxnet_tlsrec_o_bad;
+
+        mov r10, rcx;
+        sub r10, 16;                     // needed = len - TLSREC_TAG_BYTES
+        cmp r9, r10;
+        jb  libpdxnet_tlsrec_o_bad;      // out_max < recovered plaintext
+
+        // --- nonce = 0x00000000 || seq_num (big-endian, 8 bytes) ---
+        lea r11, [rip + net_tls_record_nonce];
+        mov_b [r11 + 0], 0;
+        mov_b [r11 + 1], 0;
+        mov_b [r11 + 2], 0;
+        mov_b [r11 + 3], 0;
+
+        mov r10, rsi;                    // seq working copy
+        mov rax, r10; and rax, 0xFF; mov_b [r11 + 11], rax; shr r10, 8;
+        mov rax, r10; and rax, 0xFF; mov_b [r11 + 10], rax; shr r10, 8;
+        mov rax, r10; and rax, 0xFF; mov_b [r11 +  9], rax; shr r10, 8;
+        mov rax, r10; and rax, 0xFF; mov_b [r11 +  8], rax; shr r10, 8;
+        mov rax, r10; and rax, 0xFF; mov_b [r11 +  7], rax; shr r10, 8;
+        mov rax, r10; and rax, 0xFF; mov_b [r11 +  6], rax; shr r10, 8;
+        mov rax, r10; and rax, 0xFF; mov_b [r11 +  5], rax; shr r10, 8;
+        mov rax, r10; and rax, 0xFF; mov_b [r11 +  4], rax;
+
+        // --- AeadParamsC { key_ptr, nonce_ptr, aad_ptr=0, aad_len=0 } ---
+        lea r10, [rip + net_tls_record_aead_params];
+        mov [r10 + 0], rdi;              // key_ptr
+        mov [r10 + 8], r11;              // nonce_ptr
+        xor rax, rax;
+        mov [r10 + 16], rax;             // aad_ptr = NULL
+        mov [r10 + 24], rax;             // aad_len = 0
+
+        // --- shuffle into open_raw(params, sealed, sealed_len, out, cap, written) ---
+        mov rsi, rdx;                    // ciphertext_ptr
+        mov rdx, rcx;                    // sealed_len
+        mov rcx, r8;                     // out_ptr
+        mov r8,  r9;                     // out_cap
+        lea r9,  [rip + net_tls_record_last_written];
+        mov rdi, r10;                    // params
+
+        sub rsp, 8;
+        call net_tls_record_open_raw;
+        add rsp, 8;
+
+        cmp rax, 0;
+        jne libpdxnet_tlsrec_o_fail;
+        mov rax, 0x20;                   // TLSREC_OK
+        ret;
+
+      libpdxnet_tlsrec_o_fail:
+        mov rax, 0x25;                   // TLSREC_ERR_AEAD (tag mismatch)
+        ret;
+
+      libpdxnet_tlsrec_o_bad:
+        mov rax, 0x01;                   // TLSREC_ERR_INVAL
         ret
       }
     }

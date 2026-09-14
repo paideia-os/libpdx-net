@@ -1,0 +1,281 @@
+// src/net_tls_verify.pdx -- libpdx-net.M3-003 (libpdx-net#13)
+//
+// Ed25519 transcript-signature verification -- scaffold-only,
+// R100-PREP-001 + R100-PREP-005 blocked.
+//
+// =============================================================================
+// BLOCKERS (read this first)
+// =============================================================================
+//
+// This file is SCAFFOLD-ONLY. It performs NO cryptographic
+// verification of any kind. Two separate, independently-tracked prep
+// items must close before the real body can land:
+//
+//   R100-PREP-001 -- TLS trust pinning (KIND_TLS_TRUST).
+//     The pinned-key trust anchor that tells this function WHICH
+//     public key a given server is allowed to present (design/
+//     networking/r100-user-tools-plan.md §0.5's pinned-key trust
+//     model). It does not exist kernel-side yet; pdxtrust M2 mints
+//     the real caps. Until it does, `pubkey_ptr` is a raw caller-
+//     supplied pointer with NO provenance -- nothing in this tree can
+//     say where that key came from, so even a real Ed25519 verify
+//     against it would answer the wrong question ("does this
+//     signature match this key" rather than "is this the key this
+//     host is pinned to"). See caps.decl's KIND_TLS_TRUST forward
+//     reference.
+//
+//   R100-PREP-005 -- paideia-as crypto FFI thunks.
+//     The extern-C thunk layer that makes a paideia-as crypto
+//     primitive reachable from `.pdx` source. See the "not linkable"
+//     finding below.
+//
+// =============================================================================
+// SCOPE (design/networking/r100-user-tools-plan.md §2.4 + §12.4)
+// =============================================================================
+//
+// `net_tls_verify_transcript(pubkey_ptr, sig_ptr, sig_len,
+// transcript_ptr, transcript_len) -> u64` is the M3-003 call site
+// for RFC 8446 §4.4.3 CertificateVerify: given the server's
+// (pinned) Ed25519 public key, the 64-byte detached signature the
+// server sent, and the handshake transcript those bytes are claimed
+// to cover, decide whether the signature verifies.
+//
+// Per §2.4 ("prefer Ed25519 over ML-DSA-65 for v1") Ed25519 is the
+// ONLY signature algorithm this milestone implements. The
+// MLDSA65_RESERVED tag net_tls_record.pdx already reserves in
+// TlsHandshakeRecord@0.1's `sig_algo` enum exists so a future
+// ML-DSA-65 verify path is an additive landing rather than a
+// schema break; nothing here verifies ML-DSA-65 today.
+//
+// -----------------------------------------------------------------------------
+// Why this is a WEAK stub: `paideia_crypto_ed25519_verify` is NOT linkable
+// -----------------------------------------------------------------------------
+//
+// The wave dispatch for this issue asks to call the paideia-as
+// Ed25519 verify intrinsic "if it is externally linkable from this
+// repo's toolchain, else a WEAK stub". Checking the live paideia-as
+// tree resolves that conditional to "not linkable", on two
+// independent counts:
+//
+//   1. No extern-C thunk. Ed25519 verify DID land as real,
+//      test-vector-backed Rust: `paideia_as_crypto::curve::ed25519::
+//      ed25519_verify(public: &[u8;32], msg: &[u8], signature:
+//      &[u8;64]) -> bool`, re-exported at the crate root. But the
+//      FFI layer that flattens a primitive into a `#[unsafe(
+//      no_mangle)] pub extern "C" fn` -- `paideia-as-crypto::ffi` --
+//      contains exactly three primitives' thunks today:
+//      `ffi/argon2id.rs`, `ffi/chacha20_poly1305.rs`,
+//      `ffi/ml_kem_768.rs`. There is no `ffi/ed25519.rs` and no
+//      `paideia_crypto_ed25519_verify` symbol anywhere in that
+//      module. A `.pdx` `call paideia_crypto_ed25519_verify` would
+//      emit a CALL relocation nothing in the link ever satisfies.
+//
+//   2. No stdlib lowering recipe. The OTHER (and, per
+//      tools/user/libpdx-volume/src/pdxb_crypto.pdx, the sanctioned)
+//      way `.pdx` source reaches a crypto primitive is a module-local
+//      `trait` declaration whose call site
+//      `stdlib_lowering::cryptoops` rewrites into the extern-C CALL.
+//      That dispatch table also covers exactly Argon2id /
+//      ChaCha20Poly1305 / MlKem768 / MlDsa65 -- there is no `Ed25519`
+//      arm, so a module-local `trait Ed25519 { fn verify(...) }`
+//      declared here would fail to elaborate rather than link.
+//
+// This is the same R100-PREP-005 shape net_tls_key_schedule.pdx
+// already documents for SHA-256/HKDF: the primitive is LANDED and
+// TESTED inside paideia-as, and is simply not reachable from `.pdx`.
+// Note the contrast with ChaCha20-Poly1305, which DOES have both a
+// thunk and a lowering recipe and is therefore called for real in
+// net_tls_record.pdx's M3-004 body -- "R100-PREP-005" is not a
+// single switch, it is a per-primitive FFI-exposure gap, and this
+// primitive is on the wrong side of it.
+//
+// -----------------------------------------------------------------------------
+// FAIL-CLOSED, deliberately: this stub does NOT return success
+// -----------------------------------------------------------------------------
+//
+// The issue text for this milestone suggests a stub that "returns
+// success (0) unconditionally". This file does NOT do that, and the
+// deviation is deliberate and load-bearing.
+//
+// A signature verifier is the one function in a TLS stack where a
+// fail-OPEN stub is indistinguishable from a backdoor: any caller
+// wired to it before the real body lands would accept EVERY server
+// key, including a rogue one, while the audit trail
+// (TlsHandshakeRecord@0.1) happily stamps VERDICT_OK. That is
+// precisely the outcome §0.5's pinned-key trust model exists to
+// prevent, and precisely the signal net_tls_record.pdx's own header
+// calls "the LOAD-BEARING audit signal".
+//
+// Every other stub in this repository is fail-closed
+// (net_tls_key_schedule.pdx zero-fills and returns NOT_IMPL;
+// net_api.pdx's stubs return NOT_IMPL; net_http_request.pdx's
+// encoders return a bit-63-tagged NOT_IMPL). This one follows that
+// established convention: it returns TLSV_ERR_NOT_IMPL (0x2F, ==
+// NetTypes.TLS_ERR_NOT_IMPL) on every path that reaches the
+// would-be verify. A caller that maps "nonzero" onto
+// TLSR_VERDICT_KEY_MISMATCH gets the safe answer by default; a
+// caller that requires a real verdict finds out at the first call
+// rather than in production.
+//
+// -----------------------------------------------------------------------------
+// What the stub DOES do: argument-shape validation
+// -----------------------------------------------------------------------------
+//
+// The stub is not inert. It runs the same argument-shape checks the
+// real body needs, so the checks are exercised from day one and the
+// swap does not have to introduce them alongside the crypto:
+//
+//   * pubkey_ptr / sig_ptr / transcript_ptr must all be non-NULL.
+//   * sig_len must be EXACTLY TLSV_SIG_BYTES (64) -- an Ed25519
+//     signature is R(32) || S(32) per RFC 8032 §3.3. This is the
+//     length constant most likely to be got wrong by a caller that
+//     conflates it with the 32-byte PUBLIC key length, so it is
+//     checked explicitly rather than inferred.
+//
+// A shape failure returns TLSV_ERR_INVAL (0x01, ==
+// NetTypes.NET_ERR_INVAL) -- distinguishable from
+// TLSV_ERR_NOT_IMPL, so a caller can tell "you called me wrong"
+// from "this primitive does not exist yet". Reusing the closest-fit
+// existing enum value rather than minting a parallel one is this
+// repo's established precedent (net_dns_query.pdx's DNSQ_ERR_ENCODE
+// reuse of DNS_ERR_MALFORMED; net_tls_key_schedule.pdx's
+// TKS_ERR_NOT_IMPL reuse of TLS_ERR_NOT_IMPL).
+//
+// transcript_len is deliberately NOT range-checked: a zero-length
+// transcript is a legal (if useless) Ed25519 message per RFC 8032,
+// and the real body passes it straight through to the primitive.
+//
+// -----------------------------------------------------------------------------
+// SWAP SITE (what the real body looks like once both preps close)
+// -----------------------------------------------------------------------------
+//
+// The swap is mechanical and contained to this file. Once
+// `paideia-as-crypto::ffi` grows an Ed25519 thunk AND
+// `stdlib_lowering::cryptoops` grows the matching dispatch arm,
+// this module adds -- following tools/user/libpdx-volume/src/
+// pdxb_crypto.pdx verbatim, which is the proven working template
+// for reaching a crypto intrinsic from a `.pdx` library in this org:
+//
+//   trait Ed25519 {
+//     fn verify(pubkey_ptr: u64, msg_ptr: u64, msg_len: u64,
+//               sig_ptr: u64) -> i64 !{crypto} @{paideia.crypto};
+//   }
+//
+//   pub let net_tls_verify_ed25519_raw
+//     : (u64, u64, u64, u64) -> i64 !{crypto} @{paideia.crypto} =
+//     fn (pubkey_ptr: u64, msg_ptr: u64, msg_len: u64, sig_ptr: u64) ->
+//       Ed25519::verify(pubkey_ptr, msg_ptr, msg_len, sig_ptr)
+//
+// (the plain-lambda tail-expression body is REQUIRED -- the
+// stdlib-lowering recipe only fires on a call expression at a
+// lambda-body position, it is not reachable from inside an `unsafe`
+// asm block).
+//
+// `net_tls_verify_transcript`'s own body then keeps its existing
+// shape checks, marshals (pubkey_ptr, transcript_ptr,
+// transcript_len, sig_ptr) into rdi/rsi/rdx/rcx, calls the wrapper,
+// and maps the result: 0 -> TLSV_OK, anything else ->
+// TLSV_ERR_KEY_MISMATCH. Its signature, its return-code domain, and
+// every call site are unaffected -- callers do not re-link.
+//
+// Note what the swap does NOT fix: R100-PREP-001. Even with a real
+// Ed25519 verify, `pubkey_ptr` still has no provenance until
+// KIND_TLS_TRUST lands. The honest end state is a THIRD landing in
+// which net_tls_wrap.pdx resolves a trust cap to a pinned key and
+// hands THAT pointer here.
+//
+// =============================================================================
+// paideia-as compliance
+// =============================================================================
+//
+//   - Module name PascalCase basename (`NetTlsVerify`) matches the
+//     file basename (net_tls_verify.pdx), per this repo's convention.
+//   - Labels prefixed `libpdxnet_tlsv_` -- disjoint from every other
+//     label prefix in this repo, and free of the reserved keywords
+//     (`loop`, `if`, ...) the parser claims.
+//   - No `test rN, rN` -- `cmp reg, 0` + je/jne only.
+//   - Every immediate here is a small imm32 (0, 64, 0x01, 0x2F) --
+//     no MOVABS staging needed, and no `cmp reg, imm64` anywhere
+//     (the wide-immediate compare must always stage through a
+//     register; there is no such compare in this file).
+//   - Leaf function: no nested `call`, so no callee-save prologue
+//     and no rsp alignment padding is required at all.
+//   - No multiplies -- no `imul` in any form.
+//   - String literals: none.
+
+module NetTlsVerify = structure {
+
+  // === Ed25519 wire sizes (RFC 8032 §5.1) ===================================
+  //
+  // These two are the constants a caller is most likely to swap by
+  // accident. A public key is 32 bytes (a compressed Edwards point);
+  // a signature is 64 bytes (R, a compressed point, concatenated
+  // with S, a 32-byte scalar). Neither carries a length prefix or a
+  // tag byte -- there is no off-by-one to make here, the sizes are
+  // exact and absolute.
+  pub let TLSV_PUBKEY_BYTES : u64 = 32
+  pub let TLSV_SIG_BYTES    : u64 = 64
+
+  // === Return-code domain ===================================================
+  //
+  // Every value is folded through the closest-fit existing NetTypes
+  // enum value rather than minting a parallel domain -- this repo's
+  // established precedent. TLSV_OK is unreachable at this scaffold
+  // landing (nothing verifies) but is published so callers can write
+  // the `cmp rax, TLSV_OK`-shaped check today and not re-link when
+  // the real body lands.
+  pub let TLSV_OK              : u64 = 0x20   // == NetTypes.TLS_OK
+  pub let TLSV_ERR_KEY_MISMATCH : u64 = 0x21  // == NetTypes.TLS_ERR_KEY_MISMATCH
+                                               //    (real body: sig did not
+                                               //     verify under pubkey)
+  pub let TLSV_ERR_INVAL       : u64 = 0x01   // == NetTypes.NET_ERR_INVAL
+                                               //    (caller arg shape wrong)
+  pub let TLSV_ERR_NOT_IMPL    : u64 = 0x2F   // == NetTypes.TLS_ERR_NOT_IMPL
+                                               //    (scaffold -- no verify)
+
+  // ==========================================================================
+  // net_tls_verify_transcript(pubkey_ptr, sig_ptr, sig_len,
+  //                           transcript_ptr, transcript_len) -> u64
+  //
+  // WEAK, FAIL-CLOSED scaffold. See the file header for (a) the
+  // confirmed absence of any linkable Ed25519 path from `.pdx`,
+  // (b) the R100-PREP-001 / R100-PREP-005 blockers, and (c) why
+  // this refuses rather than returning success.
+  //
+  // Returns:
+  //   TLSV_ERR_INVAL    (0x01) -- a NULL pointer argument, or
+  //                               sig_len != 64.
+  //   TLSV_ERR_NOT_IMPL (0x2F) -- arguments are well-shaped, but no
+  //                               verification was performed and NO
+  //                               TRUST DECISION MAY BE INFERRED.
+  //
+  // It never returns TLSV_OK at this landing. A caller must treat a
+  // non-TLSV_OK result as "not verified" and stamp
+  // TLSR_VERDICT_KEY_MISMATCH on its TlsHandshakeRecord@0.1.
+  // ==========================================================================
+  pub let net_tls_verify_transcript :
+    (u64, u64, u64, u64, u64) -> u64 !{} @{} =
+    fn (pubkey_ptr: u64, sig_ptr: u64, sig_len: u64,
+        transcript_ptr: u64, transcript_len: u64) -> unsafe {
+      effects: {}, capabilities: {},
+      justification: "libpdx-net.M3-003 (#13): WEAK fail-closed scaffold for RFC 8446 §4.4.3 CertificateVerify. See the file header for the confirmed finding that NEITHER route to a crypto primitive from `.pdx` reaches Ed25519 -- `paideia-as-crypto::ffi` has thunks for Argon2id/ChaCha20-Poly1305/ML-KEM-768 only (no `paideia_crypto_ed25519_verify` symbol exists to `call`), and `stdlib_lowering::cryptoops` has no `Ed25519` dispatch arm (so a module-local `trait Ed25519` would fail to elaborate) -- plus the R100-PREP-001 (KIND_TLS_TRUST pubkey provenance) and R100-PREP-005 (FFI thunk) blockers. Body runs the real body's own argument-shape gates so the swap adds only crypto: `cmp rdi,0; je bad` (pubkey_ptr), `cmp rsi,0; je bad` (sig_ptr), `cmp rcx,0; je bad` (transcript_ptr), `cmp rdx,64; jne bad` (sig_len must be exactly TLSV_SIG_BYTES -- R||S per RFC 8032 §3.3; the constant a caller most often confuses with the 32-byte pubkey length). r8=transcript_len is accepted for future-signature stability and deliberately unchecked (a zero-length message is legal for Ed25519). Falls through to `mov rax,0x2F; ret` (TLSV_ERR_NOT_IMPL) -- deliberately NOT success: a fail-open signature verifier is indistinguishable from a backdoor, and every other stub in this repo is fail-closed. bad path returns 0x01 (TLSV_ERR_INVAL, == NetTypes.NET_ERR_INVAL) so 'called wrong' is distinguishable from 'not implemented'. All four immediates (0, 64, 0x2F, 0x01) are small imm32 -- no MOVABS, and no `cmp reg,imm64` anywhere. Uses cmp/je/jne, never `test rN,rN`. Leaf -- no nested call, so no callee-save prologue and no rsp%16 padding. No memory access on any path. Labels prefixed libpdxnet_tlsv_vt_.",
+      block: {
+        cmp rdi, 0;
+        je  libpdxnet_tlsv_vt_bad;
+        cmp rsi, 0;
+        je  libpdxnet_tlsv_vt_bad;
+        cmp rcx, 0;
+        je  libpdxnet_tlsv_vt_bad;
+        cmp rdx, 64;
+        jne libpdxnet_tlsv_vt_bad;
+
+        mov rax, 0x2F;                   // TLSV_ERR_NOT_IMPL -- fail-closed
+        ret;
+
+      libpdxnet_tlsv_vt_bad:
+        mov rax, 0x01;                   // TLSV_ERR_INVAL
+        ret
+      }
+    }
+
+}

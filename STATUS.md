@@ -1,20 +1,45 @@
 # libpdx-net -- status
 
 **Wave:** R100 (client-side networking SDK)
-**Current milestone:** Wave NN (v0.4.0) -- M2-002 (#5) real
-  bind/listen/accept, M2-007 (#10) UDP resolver transport,
-  M4-004 (#20) redirect handling, M3-001 (#11) TLS ClientHello
-  scaffold, M3-002 (#12) TLS key schedule scaffold. Wave MM
-  (v0.3.0) M2-001/003/004/005/006 remain landed. TLS handshake
-  bodies remain pending R100-PREP-005 (paideia-as crypto FFI
-  thunks -- confirmed still not linkable as of this wave, see
-  net_tls_key_schedule.pdx).
-**Version:** 0.4.0 (2026-09-13)
+**Current milestone:** Wave OO (v0.5.0) -- M3-003 (#13) Ed25519
+  transcript verify (WEAK fail-closed scaffold -- not linkable) and
+  M3-004 (#14) ChaCha20-Poly1305 record layer (REAL body -- linkable).
+  Wave NN (v0.4.0) M2-002/M2-007/M4-004/M3-001/M3-002 and Wave MM
+  (v0.3.0) M2-001/003/004/005/006 remain landed.
+
+  R100-PREP-005 is NOT a single switch -- it is a per-primitive
+  FFI-exposure gap, and v0.5.0 is the wave that proves it: ChaCha20-
+  Poly1305 has both an extern-C thunk and a `cryptoops` lowering
+  recipe and is called for real; SHA-256/HKDF (M3-002) and Ed25519
+  (M3-003) are landed, tested Rust inside paideia-as with NEITHER,
+  and remain unreachable from `.pdx`. The full TLS handshake stays
+  blocked on closing that gap for the latter two, plus
+  R100-PREP-001 (KIND_TLS_TRUST) for key provenance.
+**Version:** 0.5.0 (2026-09-13)
 
 See `design/networking/r100-user-tools-plan.md` in paideia-os for the
 full R100 API surface + milestone catalog.
 
-## What ships at v0.4.0 (this wave, NEW)
+## What ships at v0.5.0 (this wave, NEW)
+
+- `src/net_tls_verify.pdx` -- **#13** M3-003 `net_tls_verify_transcript`
+  (pubkey_ptr, sig_ptr, sig_len, transcript_ptr, transcript_len).
+  WEAK, FAIL-CLOSED scaffold: no Ed25519 path is reachable from
+  `.pdx` (no `ffi/ed25519.rs` thunk, no `Ed25519` cryptoops arm), so
+  it validates argument shape (non-NULL pointers, `sig_len == 64`
+  exactly) and returns `TLSV_ERR_NOT_IMPL` (0x2F) -- deliberately not
+  success, since a fail-open verifier is indistinguishable from a
+  backdoor. Blocked on R100-PREP-005 *and* R100-PREP-001.
+- `src/net_tls_record.pdx` -- **#14** M3-004 `net_tls_seal_record` /
+  `net_tls_open_record`, a REAL ChaCha20-Poly1305 body over the
+  linkable intrinsic (real Poly1305 tag verification; a tampered
+  record is refused today). Added as an additive `TLSREC_*` section
+  of the existing `NetTlsRecord` module -- M3-005 already owns that
+  file and module, and paideia-as binds one module per file. TLS-layer
+  scaffold limits documented in the file header: zero static IV, no
+  record header, no AAD, and no key provenance.
+
+## What shipped at v0.4.0 (previous wave)
 
 - `src/net_server.pdx` -- **#5** M2-002 real `net_server_bind`/
   `net_server_listen`/`net_server_accept` trampolines (SC+ 88/89/90).

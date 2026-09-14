@@ -3,6 +3,81 @@
 All notable changes to this repository are documented here. Versioning
 follows SemVer with a v0.x series until the M5 signed release.
 
+## [0.5.0] -- 2026-09-13 (Wave OO: the M3 crypto pair)
+
+**Scope:** the two remaining M3 crypto milestones -- Ed25519
+transcript-signature verification and the ChaCha20-Poly1305 record
+layer. Both issues were dispatched as "use the intrinsic if linkable,
+else a WEAK stub"; the two resolved in OPPOSITE directions, and that
+split is the headline finding of this wave.
+
+### Landed
+
+- `#13` -- **M3-003 Ed25519 transcript verify (scaffold).**
+  `src/net_tls_verify.pdx` (module `NetTlsVerify`, new file)
+  publishes `net_tls_verify_transcript(pubkey_ptr, sig_ptr, sig_len,
+  transcript_ptr, transcript_len) -> u64`. **Not linkable** --
+  `ed25519_verify` is landed, tested Rust in
+  `paideia-as-crypto::curve::ed25519`, but there is no
+  `ffi/ed25519.rs` thunk (the FFI layer covers Argon2id /
+  ChaCha20-Poly1305 / ML-KEM-768 only) AND no `Ed25519` arm in
+  `stdlib_lowering::cryptoops`, so neither route from `.pdx` reaches
+  it. Ships the WEAK side.
+  **Deliberate deviation from the issue text:** the stub does NOT
+  "return success (0) unconditionally". A fail-open signature
+  verifier is indistinguishable from a backdoor -- it would accept
+  every rogue server key while `TlsHandshakeRecord@0.1` stamped
+  `VERDICT_OK`, defeating exactly the pinned-key trust model the
+  record exists to make legible. It returns `TLSV_ERR_NOT_IMPL`
+  (0x2F) instead, matching every other stub in this repo, and runs
+  the real body's argument-shape gates (non-NULL pointers, `sig_len
+  == 64` exactly per RFC 8032 §3.3) so a caller can distinguish
+  "called wrong" (0x01) from "not implemented".
+  Blocked on R100-PREP-005 (FFI thunk) *and* R100-PREP-001
+  (KIND_TLS_TRUST -- `pubkey_ptr` has no provenance until a trust cap
+  can supply it, so even a real verify would answer the wrong
+  question).
+
+- `#14` -- **M3-004 ChaCha20-Poly1305 record layer (real body).**
+  `src/net_tls_record.pdx` gains `net_tls_seal_record` /
+  `net_tls_open_record` (both `(key_ptr, seq_num, ptr, len, out_ptr,
+  out_max) -> u64`). **Linkable** -- both the extern-C thunks and the
+  `cryptoops` lowering recipe exist, and the path is already exercised
+  by `tools/user/libpdx-volume/src/pdxb_crypto.pdx` in paideia-os,
+  which is the template followed here (module-local `trait`
+  redeclaration + plain-lambda wrapper + `.bss` `AeadParamsC`
+  scratch). Real sealing, real opening, real Poly1305 tag
+  verification: `net_tls_open_record` refuses a tampered record
+  today.
+  Landed as an ADDITIVE section of the existing `NetTlsRecord`
+  module (constants `TLSREC_*`, labels `libpdxnet_tlsrec_*`, disjoint
+  from M3-005's `TLSR_*` / `libpdxnet_tlsr_*`). The issue named a
+  file and module M3-005 already occupies at v0.4.0, and paideia-as
+  binds one module per file -- a second `module NetTlsRecord` is a
+  duplicate-symbol link failure, not a second namespace.
+  Still SCAFFOLD at the TLS layer, and the R100-PREP-005 blocker is
+  documented in the file header: no traffic keys (the key schedule is
+  still a zero-secret stub, so `key_ptr` has no provenance), a ZERO
+  static IV so the RFC 8446 §5.3 nonce is `0x00000000 || seq_num`
+  big-endian rather than `iv XOR seq` (per-(key, seq) unique, so no
+  nonce reuse, but not interoperable), and no 5-byte record header
+  and therefore no AAD (deferred together so header bytes and AAD
+  bytes can never disagree).
+
+### Changed
+
+- `caps.decl` -- `requires:` is no longer empty. libpdx-net now holds
+  `paideia.crypto`, propagated from the ChaCha20-Poly1305 intrinsic
+  to `net_tls_seal_record` / `net_tls_open_record` and to any
+  consumer that calls them. Every syscall consumed remains ambient.
+- `src/tool_ident.pdx` -- `PDX_TOOL_VERSION` corrected to `0.5.0`; it
+  had been left at `0.3.0` through the v0.4.0 landing.
+
+### Not verified in this landing
+
+No build, assemble, or smoke run was performed as part of this commit
+(implementation-only pass; verification is a separate step).
+
 ## [0.4.0] -- 2026-09-13 (Wave NN: M2/M3/M4 tail)
 
 **Scope:** land the remaining five M2/M3/M4 issues -- server-side

@@ -76,7 +76,24 @@
 # MINTED capabilities the consumer must grant. When a real CSPRNG
 # capability lands (KIND_CSPRNG, currently unfiled) this file grows
 # a real `requires:` line pointing at it and the TXID path swaps.
-requires: <none at v0.4.0 -- every syscall consumed above is ambient>
+# v0.5.0 CHANGE -- libpdx-net now holds a real capability. M3-004
+# (#14, net_tls_record.pdx) calls the paideia-as ChaCha20-Poly1305
+# AEAD intrinsic for real (`ChaCha20Poly1305::seal`/`::open`, lowered
+# onto `paideia_crypto_chacha20_poly1305_{seal,open}`), and those
+# call sites -- and the two public entries that front them,
+# `net_tls_seal_record` / `net_tls_open_record` -- carry the
+# intrinsic's own `@{paideia.crypto}` capability annotation. This is
+# NOT a syscall and NOT ambient: it is the paideia-as crypto
+# capability, and it propagates to any consumer that calls either
+# entry point. Every syscall named above remains ambient.
+requires:
+  - paideia.crypto              # M3-004 (#14) -- ChaCha20Poly1305::seal/open
+
+# M3-003 (#13, net_tls_verify.pdx) requires NOTHING: its scaffold is
+# `!{} @{}` because no Ed25519 primitive is reachable from `.pdx` to
+# call. When R100-PREP-005 grows an Ed25519 thunk, that file's
+# `net_tls_verify_transcript` widens to `@{paideia.crypto}` too and
+# this list is unchanged (the capability is already held).
 
 # --- Declared output schemas (semantic-pipe records libpdx-net emits
 #     via sys_semantic_send). --------------------------------------------
