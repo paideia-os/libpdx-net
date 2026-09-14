@@ -1,7 +1,7 @@
 // src/net_tls_key_schedule.pdx -- libpdx-net.M3-002 (libpdx-net#12)
 //
-// TLS 1.3 key schedule (HKDF-Extract/Expand, SHA-256) -- scaffold-only,
-// R100-PREP-005 blocked.
+// TLS 1.3 key schedule (HKDF-Extract/Expand, SHA-256) -- REAL crypto
+// body as of paideia-as Wave γ (γ-03).
 //
 // =============================================================================
 // SCOPE (design/networking/r100-user-tools-plan.md §2.4 + §12.4)
@@ -18,59 +18,117 @@
 //                                    ikm=0)
 //
 // `net_tls_key_derive(shared_secret_ptr, shared_secret_len,
-// out_secrets_ptr) -> u64` is the intended real-body call site for
-// this sequence, writing all three 32-byte SHA-256-sized secrets into
-// a caller-owned 96-byte buffer (early@+0, handshake@+32, master@+64).
+// out_secrets_ptr) -> u64` performs this sequence for real, writing
+// all three 32-byte SHA-256-sized secrets into a caller-owned
+// 96-byte buffer (early@+0, handshake@+32, master@+64).
+//
+// This is the exact scope Wave γ-03 asked for -- early/handshake/
+// master secrets only. Deriving `client_write_key` / `client_write_iv`
+// / `server_write_key` / `server_write_iv` (RFC 8446 §7.3, one more
+// `Derive-Secret` + `HKDF-Expand-Label` layer on top of the traffic
+// secrets this function does NOT compute) is out of scope here and
+// not implemented anywhere in this tree yet -- see net_tls_record.pdx's
+// Wave γ-05 note for the honest statement of that remaining gap.
 //
 // -----------------------------------------------------------------------------
-// Why this is a WEAK stub, not a real HKDF body
+// "0" means Hash.length zero BYTES, not an empty string
 // -----------------------------------------------------------------------------
 //
-// The wave dispatch for this issue asks to use paideia-as's HKDF
-// intrinsic "if linkable (`paideia_crypto_hkdf_sha256`), else WEAK
-// stub returning deterministic zero-secret." Checking the live
-// paideia-as tree resolves this cleanly: HMAC-SHA256 + HKDF-Extract/
-// Expand DID land in `paideia-as-crypto::kdf::hkdf`
-// (tools/paideia-as/CHANGELOG.md, issue #1339, v0.26.0) -- but as
-// internal Rust trait methods only. The extern-C FFI thunk layer that
-// makes a paideia-as intrinsic CALLABLE from `.pdx` source
-// (`paideia-as-crypto::ffi`, issue #1348) exposes exactly THREE
-// symbols today: `paideia_crypto_argon2id_derive`,
-// `paideia_crypto_chacha20_poly1305_seal`,
-// `paideia_crypto_chacha20_poly1305_open` -- plus the separate ML-KEM
-// thunks (`paideia_crypto_ml_kem_768_{keygen,encaps,decaps}`). There
-// is NO `paideia_crypto_hkdf_sha256` (or any HKDF/HMAC-SHA256) extern
-// symbol anywhere in that FFI layer -- `.pdx` code has no `call`
-// target to reach the landed HKDF implementation with. This is
-// exactly the "if linkable" branch resolving to "not linkable", so
-// this file ships the WEAK stub side: `net_tls_key_derive` zero-fills
-// the 96-byte output buffer (fail-closed -- a zeroed secret can never
-// be mistaken for a live one that merely happens to start with a
-// zero byte, since every one of the 96 bytes is zero) and returns
-// `TKS_ERR_NOT_IMPL` (reusing NetTypes.TLS_ERR_NOT_IMPL, the same
-// established-elsewhere-in-this-repo convention of folding a stub's
-// status through the closest-fit existing enum value rather than
-// minting a parallel one -- net_dns_query.pdx's own
-// `DNSQ_ERR_ENCODE` reuse of `DNS_ERR_MALFORMED` is the precedent).
+// RFC 8446 §7.1: "If a given secret is not available, then the
+// 0-value consisting of a string of Hash.length bytes set to zeros is
+// used" -- for SHA-256, that is 32 zero bytes, NOT the empty string.
+// HKDF-Extract's underlying HMAC hashes its IKM as message data, so
+// an empty IKM and a 32-zero-byte IKM produce genuinely different PRK
+// values (different message length changes the hash). This file
+// therefore keeps a real, explicitly-zeroed 32-byte buffer
+// (`net_tls_key_zero32`) for the `ikm=0` slots and never substitutes
+// a zero-length pointer there. `salt=0`, by contrast, IS the RFC 5869
+// §2.2 empty-string convention -- `hkdf_extract`'s own HMAC construction
+// treats an empty salt as HashLen zero bytes internally, so this file
+// passes `salt_ptr=NULL, salt_len=0` for that case and relies on the
+// paideia-as-crypto side of the FFI boundary (already vector-tested
+// against RFC 5869 §A.3) to get that equivalence right.
 //
 // -----------------------------------------------------------------------------
-// R100-PREP-005 blocker (unblock condition for the real body)
+// Derive-Secret(., "derived", "") is a FIXED 49-byte HkdfLabel
 // -----------------------------------------------------------------------------
 //
-// The real body requires an extern-C thunk exposing HKDF-Extract and
-// HKDF-Expand (or a single combined `paideia_crypto_hkdf_sha256`
-// helper) added to `paideia-as-crypto::ffi`, mirroring the shape
-// issue #1348 already established for Argon2id/ChaCha20-Poly1305 --
-// this is filed as the paideia-as-side follow-up (§12.4) libpdx-net
-// tracks as R100-PREP-005; SHA-256 itself (needed for the transcript
-// hash the real M3-002/M3-003 bodies also consume) is ALSO landed
-// internally (#1338, v0.25.0) without an FFI thunk, so the same
-// follow-up should expose both in one pass. Once that thunk exists,
-// the swap here is contained: replace the zero-fill loop with the
-// RFC 8446 §7.1 sequence above, calling through the new extern
-// symbol at each Extract/Expand step; `net_tls_key_derive`'s own
-// signature, its 96-byte output layout, and every caller of it are
-// unaffected.
+// RFC 8446 §7.1's `Derive-Secret(Secret, Label, Messages) =
+// HKDF-Expand-Label(Secret, Label, Transcript-Hash(Messages),
+// Hash.length)`, and both calls to it in this ladder use the EXACT
+// SAME `Label = "derived"`, `Messages = ""` (the literal empty octet
+// string, per the RFC 8446 §7.1 diagram -- not "no transcript yet";
+// this specific Derive-Secret call always hashes zero bytes regardless
+// of what handshake transcript exists elsewhere) and `Length =
+// Hash.length = 32`. Since `Transcript-Hash("") = SHA-256("")` is the
+// well-known constant `e3b0c442...b855`, and RFC 8446 §7.1's
+// `HkdfLabel` wire structure (`uint16 length; opaque label<7..255> =
+// "tls13 " + Label; opaque context<0..255> = Context;`) is therefore
+// FULLY DETERMINED at compile time for this one call shape, the
+// entire 49-byte `HkdfLabel` blob (2-byte length=32, 1-byte
+// label-length=13, 13 label bytes "tls13 derived", 1-byte
+// context-length=32, 32 context bytes) is a compile-time constant,
+// built once per `net_tls_key_derive` call into
+// `net_tls_key_hkdf_label_derived` and reused for BOTH Derive-Secret
+// calls in the ladder (the only thing that differs between the two
+// calls is which Secret is used as the HKDF-Expand PRK input, not the
+// label/context/length). No runtime string-building or transcript
+// hashing is needed for this specific derivation.
+//
+// -----------------------------------------------------------------------------
+// How the real body reaches the intrinsic
+// -----------------------------------------------------------------------------
+//
+// Same template as net_tls_record.pdx's M3-004 ChaCha20Poly1305
+// section and net_tls_verify.pdx's γ-04 Ed25519 section: a
+// module-local `trait` redeclaration (the elaborator's
+// `stdlib_lowering::cryptoops` recipe dispatches on the literal
+// `(trait_name, method_name)` pair at the call site, not on a
+// cross-crate import) plus a plain-lambda tail-expression wrapper the
+// asm body `call`s:
+//
+//   trait Hkdf {
+//     fn sha256(params: u64, mode: u64, out_ptr: u64, out_len: u64)
+//       -> i64 !{crypto} @{paideia.crypto};
+//   }
+//
+//   pub let net_tls_key_hkdf_sha256_raw : (u64, u64, u64, u64) -> i64
+//     !{crypto} @{paideia.crypto} =
+//     fn (params: u64, mode: u64, out_ptr: u64, out_len: u64) ->
+//       Hkdf::sha256(params, mode, out_ptr, out_len)
+//
+// `paideia_crypto_hkdf_sha256` (paideia-as v0.36.2) is a single
+// symbol covering three modes via its `mode` argument -- see
+// `paideia-as-crypto::ffi::hkdf`'s own doc comment for the full
+// contract. This file uses exactly two:
+//
+//   TKS_HKDF_MODE_EXTRACT (0) -- `PRK = HKDF-Extract(salt, ikm)`,
+//     `out_len` MUST be exactly 32 (`HkdfParamsC.info_ptr`/`info_len`
+//     ignored).
+//   TKS_HKDF_MODE_EXPAND (1) -- `OKM = HKDF-Expand(PRK, info,
+//     out_len)`, reading the PRK from `HkdfParamsC.ikm_ptr`/`ikm_len`
+//     (`salt_ptr`/`salt_len` ignored).
+//
+// The `Hkdf::sha256` stdlib-lowering dispatch arm (the OTHER half of
+// the gap -- a linkable extern symbol alone is not enough, see
+// net_tls_verify.pdx's file header for the same point made about
+// `Ed25519::verify`) landed in paideia-as v0.36.3.
+//
+// -----------------------------------------------------------------------------
+// Five calls, one register plan: everything survives in .bss
+// -----------------------------------------------------------------------------
+//
+// `net_tls_key_derive` makes five separate calls to the same wrapper
+// (early-extract, derived1-expand, handshake-extract, derived2-expand,
+// master-extract), and a SysV `call` clobbers every caller-save
+// register. Rather than juggle callee-saved registers with a
+// push/pop prologue, every value that must survive a call --
+// `out_secrets_ptr`, `shared_secret_ptr`, `shared_secret_len`, the
+// running "derived" secret -- lives in a `.bss` scratch cell and is
+// reloaded via `lea reg,[rip+cell]; mov reg,[reg]` immediately before
+// it is next needed. Each of the five call sites therefore rebuilds
+// `net_tls_key_hkdf_params` from scratch rather than assuming any
+// register survives from the previous step.
 //
 // =============================================================================
 // paideia-as compliance
@@ -80,11 +138,20 @@
 //     file.
 //   - Labels prefixed `tks_` -- disjoint from every other label
 //     prefix in this repo, avoids reserved keywords.
-//   - No `test rN, rN` -- cmp/jge only.
-//   - Leaf function: no nested `call`, so no callee-save prologue and
-//     no stack-alignment padding is needed at all.
-//   - Every immediate here is a small imm32 (96, 0x2F) -- no MOVABS
-//     staging.
+//   - No `test rN, rN` -- cmp/jge/je/jne only.
+//   - Every immediate here is a small imm32 (0, 1, 32, 49, 64, 96,
+//     and the individual constant bytes of the HkdfLabel blob) -- no
+//     MOVABS staging anywhere.
+//   - Non-leaf: five nested `call`s (all to the same
+//     `net_tls_key_hkdf_sha256_raw` wrapper), each individually
+//     bracketed with its own zero-push `sub rsp,8` / `add rsp,8` --
+//     entry `rsp % 16 == 8`, so each bracket independently puts
+//     `rsp % 16 == 0` at its own call site. No pushes anywhere, so no
+//     bracket depends on any other.
+//   - No `imul` in any form.
+//   - String literals: none (the HkdfLabel's ASCII label bytes are
+//     built via individual `mov_b [mem], imm` byte stores, not a
+//     string literal).
 
 module NetTlsKeySchedule = structure {
 
@@ -95,33 +162,352 @@ module NetTlsKeySchedule = structure {
   pub let TKS_OFF_HANDSHAKE_SECRET  : u64 = 32
   pub let TKS_OFF_MASTER_SECRET     : u64 = 64
 
-  pub let TKS_ERR_NOT_IMPL : u64 = 0x2F   // == NetTypes.TLS_ERR_NOT_IMPL
+  // HKDF-SHA256 modes, matching paideia-as-crypto::ffi::hkdf's
+  // HKDF_MODE_EXTRACT / HKDF_MODE_EXPAND constants exactly.
+  pub let TKS_HKDF_MODE_EXTRACT : u64 = 0
+  pub let TKS_HKDF_MODE_EXPAND  : u64 = 1
+
+  // Size of the fixed HkdfLabel("derived", SHA-256(""), 32) blob --
+  // see the file header for the byte-by-byte derivation.
+  pub let TKS_HKDF_LABEL_DERIVED_BYTES : u64 = 49
+
+  // === Return-code domain ===================================================
+  //
+  // Folded through the closest-fit NetTypes values rather than
+  // minting a parallel domain -- this repo's established precedent.
+  pub let TKS_OK         : u64 = 0x20   // == NetTypes.TLS_OK
+  pub let TKS_ERR_INVAL  : u64 = 0x01   // == NetTypes.NET_ERR_INVAL
+                                         //    (caller arg shape wrong)
+  pub let TKS_ERR_DERIVE : u64 = 0x22   // == NetTypes.TLS_ERR_HANDSHAKE
+                                         //    (the HKDF intrinsic itself
+                                         //     refused -- should not
+                                         //     happen given this file's
+                                         //     own well-formed calls,
+                                         //     but checked and folded
+                                         //     through the closest-fit
+                                         //     "structural handshake
+                                         //     failure" code rather than
+                                         //     assumed away)
+
+  // --------------------------------------------------------------------------
+  // Module-local trait redeclaration -- see the file header's "How the
+  // real body reaches the intrinsic" section.
+  // --------------------------------------------------------------------------
+  trait Hkdf {
+    fn sha256(params: u64, mode: u64, out_ptr: u64, out_len: u64)
+      -> i64 !{crypto} @{paideia.crypto};
+  }
+
+  // --------------------------------------------------------------------------
+  // Plain-lambda trait-call wrapper -- the ONLY way to reach the
+  // stdlib-lowering recipe is a call expression at a lambda-body /
+  // tail-expression (or unsafe-block statement) position, so the asm
+  // body below `call`s this wrapper five times rather than invoking
+  // the trait method directly from inside `unsafe { }`.
+  // --------------------------------------------------------------------------
+  pub let net_tls_key_hkdf_sha256_raw :
+    (u64, u64, u64, u64) -> i64 !{crypto} @{paideia.crypto} =
+    fn (params: u64, mode: u64, out_ptr: u64, out_len: u64) ->
+      Hkdf::sha256(params, mode, out_ptr, out_len)
+
+  // --------------------------------------------------------------------------
+  // Module-scoped scratch. All non-reentrant, single-writer by
+  // convention (§0.3), matching every other AEAD/KDF scratch buffer
+  // in this repo (e.g. net_tls_record.pdx's `net_tls_record_aead_params`).
+  // --------------------------------------------------------------------------
+
+  // HkdfParamsC (Rust #[repr(C)], verified against
+  // paideia-as-crypto/src/ffi/hkdf.rs): salt_ptr, salt_len, ikm_ptr,
+  // ikm_len, info_ptr, info_len -- six u64 slots, 48 bytes exactly.
+  pub let mut net_tls_key_hkdf_params : [u8; 48] = uninit @align(8)
+
+  // Explicitly-zeroed 32-byte IKM for the two `ikm=0` slots (RFC 8446
+  // §7.1's "0-value" -- Hash.length zero BYTES, not an empty string;
+  // see the file header). Zeroed once per `net_tls_key_derive` call
+  // via the same zero-fill loop shape this file's prior WEAK-stub
+  // landing already used, NOT trusted to come pre-zeroed from `.bss`
+  // -- this buffer is recomputed every call, unlike the persistent
+  // seq_num counters net_tls_record.pdx's Wave γ-05 landing added
+  // (see that file's own note on the distinction).
+  pub let mut net_tls_key_zero32 : [u8; 32] = uninit @align(8)
+
+  // The fixed 49-byte HkdfLabel("derived", SHA-256(""), 32) blob --
+  // see the file header for the byte-by-byte derivation. Built once
+  // per call and reused for both Derive-Secret steps.
+  pub let mut net_tls_key_hkdf_label_derived : [u8; 49] = uninit @align(8)
+
+  // Holds the current "derived" secret (Derive-Secret(., "derived",
+  // "")'s 32-byte output) between the Expand step that produces it
+  // and the Extract step that consumes it as salt. Overwritten twice
+  // per call (once per rung of the ladder).
+  pub let mut net_tls_key_derived_scratch : [u8; 32] = uninit @align(8)
+
+  // Argument values persisted across the five nested `call`s (a SysV
+  // `call` clobbers every caller-save register, so anything needed
+  // after the first call must live somewhere a call cannot touch).
+  pub let mut net_tls_key_out_ptr_save    : u64 = uninit @align(8)
+  pub let mut net_tls_key_shared_ptr_save : u64 = uninit @align(8)
+  pub let mut net_tls_key_shared_len_save : u64 = uninit @align(8)
 
   // ==========================================================================
   // net_tls_key_derive(shared_secret_ptr, shared_secret_len, out_secrets_ptr) -> u64
-  // ==========================================================================
   //
-  // WEAK stub -- see file header for the R100-PREP-005 blocker and
-  // the "no linkable paideia_crypto_hkdf_sha256" finding. Zero-fills
-  // the full 96-byte output (early/handshake/master secrets, 32 bytes
-  // each) and returns TKS_ERR_NOT_IMPL; `shared_secret_ptr` /
-  // `shared_secret_len` are accepted (matching the real body's future
-  // signature) but unread at this landing.
+  // REAL RFC 8446 §7.1 key schedule (Wave γ-03): early_secret @+0,
+  // handshake_secret @+32, master_secret @+64 of the caller-owned
+  // 96-byte `out_secrets_ptr` buffer.
+  //
+  // Returns TKS_OK (0x20) on success, TKS_ERR_INVAL (0x01) for a NULL
+  // `out_secrets_ptr`, or a NULL `shared_secret_ptr` paired with a
+  // nonzero `shared_secret_len`, and TKS_ERR_DERIVE (0x22) if the
+  // HKDF intrinsic itself refuses at any of the five steps (should
+  // not happen given this file's own well-formed calls, but checked
+  // rather than assumed).
   // ==========================================================================
-  pub let net_tls_key_derive : (u64, u64, u64) -> u64 !{mem} @{} =
+  pub let net_tls_key_derive :
+    (u64, u64, u64) -> u64 !{crypto, mem} @{paideia.crypto} =
     fn (shared_secret_ptr: u64, shared_secret_len: u64, out_secrets_ptr: u64) -> unsafe {
-      effects: {mem}, capabilities: {},
-      justification: "libpdx-net.M3-002 (#12): WEAK stub for the RFC 8446 §7.1 key schedule -- see file header for the confirmed absence of a linkable `paideia_crypto_hkdf_sha256` extern-C thunk (paideia-as-crypto::ffi exposes only Argon2id/ChaCha20-Poly1305/ML-KEM-768 today, per tools/paideia-as/CHANGELOG.md #1348) and the R100-PREP-005 blocker this stub documents. Leaf -- no nested call, so no callee-save prologue and no alignment padding. rdx=out_secrets_ptr (rdi/rsi = shared_secret_ptr/len, both accepted for future-signature stability but never read at this stub). rax=i (byte index) zero-fills all 96 bytes of *out_secrets_ptr via `cmp rax,96; jge done; mov_b [rdx+rax],0; add rax,1; jmp loop` -- fail-closed: a zeroed 96-byte buffer can never be mistaken for a live secret merely because it happens to start with a zero byte, since every byte is zero. Returns TKS_ERR_NOT_IMPL (0x2F, == NetTypes.TLS_ERR_NOT_IMPL, reused per this repo's established closest-fit-enum-reuse precedent). No `test rN,rN`. Labels prefixed tks_.",
+      effects: {crypto, mem}, capabilities: {paideia.crypto},
+      justification: "libpdx-net.M3-002 (#12) Wave γ-03: real RFC 8446 §7.1 key schedule over the now-linkable `paideia_crypto_hkdf_sha256` (paideia-as v0.36.2 thunk + v0.36.3 `Hkdf::sha256` dispatch arm). Gates: rdx(out_secrets_ptr)!=0 (`cmp rdx,0; je bad`), then rdi(shared_secret_ptr)==0 branches to check rsi(shared_secret_len)!=0 (null ptr + nonzero len -> bad); rdi!=0 skips straight past that check (any length, including 0, is an acceptable shape for a non-NULL pointer) -- mirrors the FFI thunk's own NULL-iff-zero-length optional-slice convention. Args persisted to .bss (`net_tls_key_out_ptr_save`=rdx, `net_tls_key_shared_ptr_save`=rdi, `net_tls_key_shared_len_save`=rsi) before any call, since a SysV call clobbers rdi/rsi/rdx/rcx/r8/r9/r10/r11/rax unconditionally and this function makes five of them. `net_tls_key_zero32` is zero-filled via the `xor rax,rax; cmp rax,32; jge done; mov_b[r11+rax],0; add rax,1; jmp loop` shape this file's own prior WEAK-stub landing already used (loop trip count 32 instead of 96). `net_tls_key_hkdf_label_derived` is built via 49 individual `mov_b [r11+N], imm` immediate stores -- the fixed HkdfLabel('derived', SHA-256(''), 32) bytes derived in the file header (length=0x0020 BE, label_len=0x0D, 13 ASCII label bytes, context_len=0x20, 32 SHA-256('') context bytes) -- built once, reused by both Expand steps. Five HKDF calls follow, EACH rebuilding `net_tls_key_hkdf_params` (6 u64 fields, 48 bytes) from .bss/immediate values from scratch rather than trusting any register to survive the PRIOR call: (1) EXTRACT salt=NULL/0,ikm=&zero32/32 -> out_secrets_ptr+0,len 32 = early_secret; (2) EXPAND ikm=out_secrets_ptr+0/32 (reloaded from the out_ptr_save cell),info=&label/49 -> &derived_scratch,len 32 = Derive-Secret(early,'derived',''); (3) EXTRACT salt=&derived_scratch/32,ikm=shared_secret (reloaded from its two save cells) -> out_secrets_ptr+32,len 32 = handshake_secret; (4) EXPAND ikm=out_secrets_ptr+32/32,info=&label/49 -> &derived_scratch (overwritten),len 32 = Derive-Secret(handshake,'derived',''); (5) EXTRACT salt=&derived_scratch/32,ikm=&zero32/32 -> out_secrets_ptr+64,len 32 = master_secret. Every call site: `mov rdi,params_ptr; mov rsi,mode; mov rdx,out_ptr; mov rcx,32` then its own `sub rsp,8; call net_tls_key_hkdf_sha256_raw; add rsp,8` (zero pushes, entry rsp%16==8, so each bracket independently reaches rsp%16==0 at its own call -- no bracket depends on any other), then `cmp rax,0; jne tks_fail` (one small-imm32 comparison covers every negative FFI error code). Falls through past step (5)'s gate to `mov rax,0x20; ret` (TKS_OK). No `test rN,rN`, no `cmp reg,imm64` anywhere (every compared/added immediate -- 0,1,32,48,49,64,96, and the HkdfLabel bytes -- is a small imm32), no `imul`. Labels prefixed tks_.",
       block: {
+        cmp rdx, 0;
+        je  tks_bad;
+        cmp rdi, 0;
+        je  tks_check_shared_len;
+        jmp tks_gates_ok;
+      tks_check_shared_len:
+        cmp rsi, 0;
+        jne tks_bad;
+      tks_gates_ok:
+
+        lea r10, [rip + net_tls_key_out_ptr_save];
+        mov [r10 + 0], rdx;
+        lea r10, [rip + net_tls_key_shared_ptr_save];
+        mov [r10 + 0], rdi;
+        lea r10, [rip + net_tls_key_shared_len_save];
+        mov [r10 + 0], rsi;
+
+        // --- zero-fill net_tls_key_zero32 (32 bytes) ---
+        lea r11, [rip + net_tls_key_zero32];
         xor rax, rax;
       tks_zero_loop:
-        cmp rax, 96;
+        cmp rax, 32;
         jge tks_zero_done;
-        mov_b [rdx + rax], 0;
+        mov_b [r11 + rax], 0;
         add rax, 1;
         jmp tks_zero_loop;
       tks_zero_done:
-        mov rax, 0x2F;                   // TKS_ERR_NOT_IMPL
+
+        // --- build HkdfLabel("derived", SHA-256(""), 32) -- 49 bytes ---
+        lea r11, [rip + net_tls_key_hkdf_label_derived];
+        mov_b [r11 + 0], 0x00;
+        mov_b [r11 + 1], 0x20;
+        mov_b [r11 + 2], 0x0D;
+        mov_b [r11 + 3], 0x74;
+        mov_b [r11 + 4], 0x6C;
+        mov_b [r11 + 5], 0x73;
+        mov_b [r11 + 6], 0x31;
+        mov_b [r11 + 7], 0x33;
+        mov_b [r11 + 8], 0x20;
+        mov_b [r11 + 9], 0x64;
+        mov_b [r11 + 10], 0x65;
+        mov_b [r11 + 11], 0x72;
+        mov_b [r11 + 12], 0x69;
+        mov_b [r11 + 13], 0x76;
+        mov_b [r11 + 14], 0x65;
+        mov_b [r11 + 15], 0x64;
+        mov_b [r11 + 16], 0x20;
+        mov_b [r11 + 17], 0xE3;
+        mov_b [r11 + 18], 0xB0;
+        mov_b [r11 + 19], 0xC4;
+        mov_b [r11 + 20], 0x42;
+        mov_b [r11 + 21], 0x98;
+        mov_b [r11 + 22], 0xFC;
+        mov_b [r11 + 23], 0x1C;
+        mov_b [r11 + 24], 0x14;
+        mov_b [r11 + 25], 0x9A;
+        mov_b [r11 + 26], 0xFB;
+        mov_b [r11 + 27], 0xF4;
+        mov_b [r11 + 28], 0xC8;
+        mov_b [r11 + 29], 0x99;
+        mov_b [r11 + 30], 0x6F;
+        mov_b [r11 + 31], 0xB9;
+        mov_b [r11 + 32], 0x24;
+        mov_b [r11 + 33], 0x27;
+        mov_b [r11 + 34], 0xAE;
+        mov_b [r11 + 35], 0x41;
+        mov_b [r11 + 36], 0xE4;
+        mov_b [r11 + 37], 0x64;
+        mov_b [r11 + 38], 0x9B;
+        mov_b [r11 + 39], 0x93;
+        mov_b [r11 + 40], 0x4C;
+        mov_b [r11 + 41], 0xA4;
+        mov_b [r11 + 42], 0x95;
+        mov_b [r11 + 43], 0x99;
+        mov_b [r11 + 44], 0x1B;
+        mov_b [r11 + 45], 0x78;
+        mov_b [r11 + 46], 0x52;
+        mov_b [r11 + 47], 0xB8;
+        mov_b [r11 + 48], 0x55;
+
+        // ====================================================================
+        // STEP 1: early_secret = HKDF-Extract(salt=0, ikm=zero32) -> +0
+        // ====================================================================
+        lea r10, [rip + net_tls_key_hkdf_params];
+        xor rax, rax;
+        mov [r10 + 0], rax;              // salt_ptr = NULL
+        mov [r10 + 8], rax;              // salt_len = 0
+        lea rcx, [rip + net_tls_key_zero32];
+        mov [r10 + 16], rcx;             // ikm_ptr = &zero32
+        mov rax, 32;
+        mov [r10 + 24], rax;             // ikm_len = 32
+        xor rax, rax;
+        mov [r10 + 32], rax;             // info_ptr = NULL
+        mov [r10 + 40], rax;             // info_len = 0
+
+        mov rdi, r10;
+        mov rsi, 0;                      // TKS_HKDF_MODE_EXTRACT
+        lea rax, [rip + net_tls_key_out_ptr_save];
+        mov rdx, [rax];                  // out_ptr = out_secrets_ptr + 0
+        mov rcx, 32;
+
+        sub rsp, 8;
+        call net_tls_key_hkdf_sha256_raw;
+        add rsp, 8;
+
+        cmp rax, 0;
+        jne tks_fail;
+
+        // ====================================================================
+        // STEP 2: derived1 = Derive-Secret(early_secret,"derived","") -> scratch
+        // ====================================================================
+        lea r10, [rip + net_tls_key_hkdf_params];
+        xor rax, rax;
+        mov [r10 + 0], rax;              // salt_ptr = NULL (ignored, expand mode)
+        mov [r10 + 8], rax;              // salt_len = 0
+        lea rax, [rip + net_tls_key_out_ptr_save];
+        mov rcx, [rax];                  // rcx = out_secrets_ptr (early_secret @+0)
+        mov [r10 + 16], rcx;             // ikm_ptr
+        mov rax, 32;
+        mov [r10 + 24], rax;             // ikm_len = 32
+        lea rax, [rip + net_tls_key_hkdf_label_derived];
+        mov [r10 + 32], rax;             // info_ptr
+        mov rax, 49;
+        mov [r10 + 40], rax;             // info_len = 49
+
+        mov rdi, r10;
+        mov rsi, 1;                      // TKS_HKDF_MODE_EXPAND
+        lea rdx, [rip + net_tls_key_derived_scratch];
+        mov rcx, 32;
+
+        sub rsp, 8;
+        call net_tls_key_hkdf_sha256_raw;
+        add rsp, 8;
+
+        cmp rax, 0;
+        jne tks_fail;
+
+        // ====================================================================
+        // STEP 3: handshake_secret = HKDF-Extract(salt=derived1,
+        //         ikm=shared_secret) -> +32
+        // ====================================================================
+        lea r10, [rip + net_tls_key_hkdf_params];
+        lea rax, [rip + net_tls_key_derived_scratch];
+        mov [r10 + 0], rax;              // salt_ptr = &derived_scratch
+        mov rax, 32;
+        mov [r10 + 8], rax;              // salt_len = 32
+        lea rax, [rip + net_tls_key_shared_ptr_save];
+        mov rcx, [rax];                  // rcx = shared_secret_ptr
+        mov [r10 + 16], rcx;             // ikm_ptr
+        lea rax, [rip + net_tls_key_shared_len_save];
+        mov rcx, [rax];                  // rcx = shared_secret_len
+        mov [r10 + 24], rcx;             // ikm_len
+        xor rax, rax;
+        mov [r10 + 32], rax;             // info_ptr = NULL (ignored, extract mode)
+        mov [r10 + 40], rax;             // info_len = 0
+
+        mov rdi, r10;
+        mov rsi, 0;                      // TKS_HKDF_MODE_EXTRACT
+        lea rax, [rip + net_tls_key_out_ptr_save];
+        mov rdx, [rax];
+        add rdx, 32;                     // out_ptr = out_secrets_ptr + 32
+        mov rcx, 32;
+
+        sub rsp, 8;
+        call net_tls_key_hkdf_sha256_raw;
+        add rsp, 8;
+
+        cmp rax, 0;
+        jne tks_fail;
+
+        // ====================================================================
+        // STEP 4: derived2 = Derive-Secret(handshake_secret,"derived","") -> scratch
+        // ====================================================================
+        lea r10, [rip + net_tls_key_hkdf_params];
+        xor rax, rax;
+        mov [r10 + 0], rax;              // salt_ptr = NULL (ignored, expand mode)
+        mov [r10 + 8], rax;              // salt_len = 0
+        lea rax, [rip + net_tls_key_out_ptr_save];
+        mov rcx, [rax];
+        add rcx, 32;                     // rcx = out_secrets_ptr + 32 (handshake_secret)
+        mov [r10 + 16], rcx;             // ikm_ptr
+        mov rax, 32;
+        mov [r10 + 24], rax;             // ikm_len = 32
+        lea rax, [rip + net_tls_key_hkdf_label_derived];
+        mov [r10 + 32], rax;             // info_ptr
+        mov rax, 49;
+        mov [r10 + 40], rax;             // info_len = 49
+
+        mov rdi, r10;
+        mov rsi, 1;                      // TKS_HKDF_MODE_EXPAND
+        lea rdx, [rip + net_tls_key_derived_scratch];
+        mov rcx, 32;
+
+        sub rsp, 8;
+        call net_tls_key_hkdf_sha256_raw;
+        add rsp, 8;
+
+        cmp rax, 0;
+        jne tks_fail;
+
+        // ====================================================================
+        // STEP 5: master_secret = HKDF-Extract(salt=derived2, ikm=zero32) -> +64
+        // ====================================================================
+        lea r10, [rip + net_tls_key_hkdf_params];
+        lea rax, [rip + net_tls_key_derived_scratch];
+        mov [r10 + 0], rax;              // salt_ptr = &derived_scratch
+        mov rax, 32;
+        mov [r10 + 8], rax;              // salt_len = 32
+        lea rax, [rip + net_tls_key_zero32];
+        mov [r10 + 16], rax;             // ikm_ptr = &zero32
+        mov rax, 32;
+        mov [r10 + 24], rax;             // ikm_len = 32
+        xor rax, rax;
+        mov [r10 + 32], rax;             // info_ptr = NULL (ignored, extract mode)
+        mov [r10 + 40], rax;             // info_len = 0
+
+        mov rdi, r10;
+        mov rsi, 0;                      // TKS_HKDF_MODE_EXTRACT
+        lea rax, [rip + net_tls_key_out_ptr_save];
+        mov rdx, [rax];
+        add rdx, 64;                     // out_ptr = out_secrets_ptr + 64
+        mov rcx, 32;
+
+        sub rsp, 8;
+        call net_tls_key_hkdf_sha256_raw;
+        add rsp, 8;
+
+        cmp rax, 0;
+        jne tks_fail;
+
+        mov rax, 0x20;                   // TKS_OK
+        ret;
+
+      tks_fail:
+        mov rax, 0x22;                   // TKS_ERR_DERIVE
+        ret;
+
+      tks_bad:
+        mov rax, 0x01;                   // TKS_ERR_INVAL
         ret
       }
     }

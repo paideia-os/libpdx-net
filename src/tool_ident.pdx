@@ -49,17 +49,18 @@ module ToolIdent = structure {
   // VersionBackend::emit_default at run time via `lea rdi, [rip +
   // PDX_TOOL_VERSION]`.
   //
-  // v0.5.0 -- Wave OO (libpdx-net#13/#14): the M3 crypto pair.
-  // net_tls_verify.pdx (#13, M3-003) Ed25519 transcript verify --
-  // WEAK fail-closed scaffold, no linkable Ed25519 path from `.pdx`;
-  // net_tls_record.pdx (#14, M3-004) ChaCha20-Poly1305 record layer
-  // -- a REAL body over the linkable AEAD intrinsic, added as an
-  // additive section of the existing NetTlsRecord module.
+  // v0.6.0 -- Wave γ (libpdx-net#12/#13/#14): all three M3 crypto
+  // gaps close for real. net_tls_key_schedule.pdx (#12, M3-002) HKDF
+  // key schedule and net_tls_verify.pdx (#13, M3-003) Ed25519
+  // transcript verify both flip from WEAK scaffold to REAL body over
+  // the now-linkable paideia-as v0.36.2/v0.36.3 intrinsics;
+  // net_tls_record.pdx (#14, M3-004) gains a real RFC 8446 §5.3
+  // per-record nonce (IV XOR a real internal seq_num counter,
+  // replacing the prior zero-IV placeholder).
   //
-  // (This literal was left at 0.3.0 through the v0.4.0 landing --
-  // corrected here. Keep it in lockstep with manifest.pdxproj
-  // `version` and the top CHANGELOG.md entry from now on.)
+  // Keep this in lockstep with manifest.pdxproj `version` and the
+  // top CHANGELOG.md entry from now on.
   // ============================================================================
-  pub let PDX_TOOL_VERSION : [u8; 6] = "0.5.0\0"
+  pub let PDX_TOOL_VERSION : [u8; 6] = "0.6.0\0"
 
 }

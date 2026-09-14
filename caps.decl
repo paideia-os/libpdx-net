@@ -88,12 +88,19 @@
 # entry point. Every syscall named above remains ambient.
 requires:
   - paideia.crypto              # M3-004 (#14) -- ChaCha20Poly1305::seal/open
+                                 # Wave γ-03 (#12) -- Hkdf::sha256
+                                 # Wave γ-04 (#13) -- Ed25519::verify
 
-# M3-003 (#13, net_tls_verify.pdx) requires NOTHING: its scaffold is
-# `!{} @{}` because no Ed25519 primitive is reachable from `.pdx` to
-# call. When R100-PREP-005 grows an Ed25519 thunk, that file's
-# `net_tls_verify_transcript` widens to `@{paideia.crypto}` too and
-# this list is unchanged (the capability is already held).
+# Wave γ UPDATE -- both remaining R100-PREP-005 gaps closed. M3-002
+# (#12, net_tls_key_schedule.pdx `net_tls_key_derive`) now calls
+# `Hkdf::sha256` for real (paideia-as v0.36.2 thunk + v0.36.3
+# `Hkdf::sha256` dispatch arm), and M3-003 (#13, net_tls_verify.pdx
+# `net_tls_verify_transcript`) now calls `Ed25519::verify` for real
+# (same paideia-as versions, `ffi::ed25519` + the `Ed25519` dispatch
+# arm). Both carry the same `@{paideia.crypto}` capability annotation
+# the ChaCha20-Poly1305 call sites already did, so this list is
+# unchanged -- exactly the "capability is already held" outcome this
+# comment predicted before Wave γ landed.
 
 # --- Declared output schemas (semantic-pipe records libpdx-net emits
 #     via sys_semantic_send). --------------------------------------------
@@ -144,16 +151,12 @@ consumes_input_schemas: []
 #     verification of any kind at this scaffold landing, so the
 #     capability is not yet consumed in practice either.
 #
-#   R100-PREP-005 (paideia-as crypto FFI thunks -- SHA-256/HKDF)
-#     -- as of v0.4.0, confirmed NOT linkable from `.pdx`: HKDF-Extract/
-#     Expand + HMAC-SHA256 landed internally in paideia-as-crypto
-#     (#1339, v0.26.0) and SHA-256 likewise (#1338, v0.25.0), but
-#     neither has an extern-C thunk in paideia-as-crypto::ffi (#1348
-#     exposes only Argon2id / ChaCha20-Poly1305 / ML-KEM-768 today).
-#     net_tls_key_schedule.pdx's net_tls_key_derive is therefore a
-#     WEAK zero-secret stub pending this thunk landing paideia-as-side
-#     -- see that file's own header for the full finding and swap-site
-#     note.
+#   R100-PREP-005 (paideia-as crypto FFI thunks -- SHA-256/HKDF/Ed25519)
+#     -- CLOSED as of Wave γ (paideia-as v0.36.2 thunks + v0.36.3
+#     stdlib-lowering dispatch arms). net_tls_key_schedule.pdx's
+#     net_tls_key_derive and net_tls_verify.pdx's
+#     net_tls_verify_transcript both now call real intrinsics -- see
+#     each file's own header for the landing note.
 #
 #   KIND_CSPRNG         (unfiled)                              -- the
 #     future replacement for the WEAK_ENTROPY_FALLBACK path in

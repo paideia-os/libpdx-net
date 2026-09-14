@@ -3,6 +3,95 @@
 All notable changes to this repository are documented here. Versioning
 follows SemVer with a v0.x series until the M5 signed release.
 
+## [0.6.0] -- 2026-09-14 (Wave γ: the M3 crypto pair, for real)
+
+**Scope:** the two remaining "WEAK, not linkable" gaps from v0.5.0 --
+HKDF-SHA256 (M3-002) and Ed25519 verify (M3-003) -- both close for
+real this wave, on the paideia-as side (v0.36.2 FFI thunks + v0.36.3
+`Hkdf`/`Ed25519` stdlib-lowering dispatch arms, landed as part of the
+same wave) and here. M3-004's ChaCha20-Poly1305 record layer also
+gains its own real upgrade: the per-record nonce moves from a
+zero-IV placeholder to the actual RFC 8446 §5.3 construction.
+
+### Landed
+
+- `#12` -- **M3-002 TLS 1.3 key schedule (real body).**
+  `src/net_tls_key_schedule.pdx`'s `net_tls_key_derive(shared_secret_ptr,
+  shared_secret_len, out_secrets_ptr) -> u64` now performs the real
+  RFC 8446 §7.1 ladder: `early_secret = HKDF-Extract(salt=0, ikm=0)`,
+  `handshake_secret = HKDF-Extract(salt=Derive-Secret(early,"derived",""),
+  ikm=shared_secret)`, `master_secret = HKDF-Extract(salt=
+  Derive-Secret(handshake,"derived",""), ikm=0)` -- five calls total
+  to the new `paideia_crypto_hkdf_sha256` intrinsic via a module-local
+  `trait Hkdf` redeclaration (same template as M3-004's
+  `ChaCha20Poly1305` trait). `Derive-Secret(.,"derived","")`'s
+  `HkdfLabel` is a fixed 49-byte compile-time constant for this call
+  shape (label="derived", context=SHA-256(""), length=32) built via
+  immediate byte stores, not runtime string/hash construction. Every
+  value that must survive across the five nested `call`s (a SysV call
+  clobbers all caller-save registers) lives in `.bss` scratch,
+  reloaded fresh before each call rather than trusted to survive in a
+  register. Out of scope (and NOT implemented anywhere in this tree
+  yet): deriving `client_write_key`/`client_write_iv` from these
+  traffic secrets (RFC 8446 §7.3) -- that is a further landing.
+  Signature unchanged from the WEAK-stub landing; only the body
+  swapped.
+
+- `#13` -- **M3-003 Ed25519 transcript verify (real body).**
+  `src/net_tls_verify.pdx`'s `net_tls_verify_transcript` now calls
+  the real `paideia_crypto_ed25519_verify` intrinsic via a
+  module-local `trait Ed25519` redeclaration, after the same
+  argument-shape gates the WEAK scaffold already ran (non-NULL
+  pointers, `sig_len == 64` exactly). Because the underlying thunk
+  returns `i32` while every other crypto thunk in this repo returns
+  `i64`, and x86_64 architecturally zero-extends (not sign-extends) a
+  32-bit register write into its 64-bit parent, the result mapping
+  checks `cmp rax, 1` against the exact success sentinel rather than
+  attempting to read a negative error code out of RAX -- anything
+  other than the literal success value collapses to
+  `TLSV_ERR_KEY_MISMATCH`, which is both simpler and correctly
+  fail-closed. R100-PREP-001 (KIND_TLS_TRUST pinning) remains open:
+  `pubkey_ptr` still has no provenance of its own, so a `TLSV_OK`
+  result means "the signature matches this key", not yet "this is the
+  key the host is pinned to". Signature and return-code domain
+  unchanged from the WEAK-stub landing.
+
+- `#14` -- **M3-004 ChaCha20-Poly1305 record layer (real nonce).**
+  `net_tls_seal_record` / `net_tls_open_record` signatures change
+  from `(key_ptr, seq_num, ptr, len, out_ptr, out_max)` to `(key_ptr,
+  iv_ptr, ptr, len, out_ptr, out_max)`: `seq_num` is no longer a
+  caller-supplied argument. Each function now owns a real,
+  module-scoped, monotonically-incrementing `u64` counter
+  (`net_tls_record_seal_seq_num` / `_open_seq_num`, one per direction
+  per RFC 8446's independent per-direction sequence spaces), starting
+  at 0 and incrementing by 1 per call -- seq_num reuse is now
+  structurally impossible from this call site. The nonce itself is
+  the real RFC 8446 §5.3 construction, `*iv_ptr XOR
+  left_pad_64bit(seq_num)`, replacing the prior zero-IV placeholder
+  (`0x00000000 || seq_num`). `key_ptr` / `iv_ptr` still have no
+  provenance (the traffic-key/IV derivation step from M3-002's traffic
+  secrets is not implemented anywhere in this tree yet), and there is
+  still no record header / AAD -- both honestly documented as
+  remaining gaps in the file header. No callers exist anywhere in this
+  tree yet, so the signature change breaks nothing.
+
+### Changed
+
+- `caps.decl` -- capability commentary updated: R100-PREP-005 is now
+  CLOSED for all three primitives (ChaCha20-Poly1305 already was;
+  HKDF and Ed25519 join it this wave). No new `requires:` line needed
+  -- `Hkdf::sha256` and `Ed25519::verify` both carry the same
+  `@{paideia.crypto}` annotation the ChaCha20-Poly1305 call sites
+  already held, exactly as this file's own v0.5.0 comment predicted.
+- `src/tool_ident.pdx` -- `PDX_TOOL_VERSION` -> `0.6.0`.
+- `manifest.pdxproj` -- `version` -> `0.6.0`.
+
+### Not verified in this landing
+
+No build, assemble, or smoke run was performed as part of this commit
+(implementation-only pass; verification is a separate step -- builds
+are main-only in this org's standing workflow).
+
 ## [0.5.0] -- 2026-09-13 (Wave OO: the M3 crypto pair)
 
 **Scope:** the two remaining M3 crypto milestones -- Ed25519

@@ -20,7 +20,7 @@
 # -- the mkfs.pdxfs pattern (parses, does not transmit, ships anyway).
 
 name        = libpdx-net
-version     = 0.5.0
+version     = 0.6.0
 kind        = shared-library
 output      = build-out/libpdx-net.a
 caps_decl   = caps.decl
